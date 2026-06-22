@@ -253,8 +253,8 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
 
     def _check(cnt):
         area = cv2.contourArea(cnt)
-        # Min: ~50×50 px at 1280×720; Max: ~40% of frame
-        if not (fa * 0.002 <= area <= fa * 0.40):
+        # Dice should be a reasonable size — not tiny noise, not huge objects
+        if not (fa * 0.003 <= area <= fa * 0.30):
             return None
         peri = cv2.arcLength(cnt, True)
         if peri == 0:
@@ -262,12 +262,18 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
         rx, ry, rw, rh = cv2.boundingRect(cnt)
         if rh == 0:
             return None
-        if not (0.45 <= rw/rh <= 2.0):
+        # Dice are roughly square — allow slight rectangle for perspective/angle
+        if not (0.55 <= rw/rh <= 1.65):
             return None
-        if area / (rw * rh) < 0.30:
+        # Must fill its bounding box well (rules out L-shapes, lines, blobs)
+        if area / (rw * rh) < 0.42:
+            return None
+        # Squareness bonus: contour must be roughly convex like a square
+        hull_area = cv2.contourArea(cv2.convexHull(cnt))
+        if hull_area > 0 and area / hull_area < 0.70:
             return None
         approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-        if not (4 <= len(approx) <= 12):
+        if not (4 <= len(approx) <= 8):
             return None
         return (rx, ry, rw, rh)
 
@@ -539,20 +545,18 @@ def _detect_die_value(roi) -> Tuple[int, float, str]:
     tmpl_val, tmpl_conf = _classify_roi(roi)
     pip_val,  pip_conf  = _count_pips(roi)
 
-    if tmpl_conf >= 0.40 and tmpl_val > 0:        # strong template hit
+    if tmpl_conf >= 0.48 and tmpl_val > 0:        # strong template hit
         return tmpl_val, tmpl_conf, "template"
     if tmpl_val > 0 and pip_val > 0:               # both have signal — pick better
         if tmpl_conf >= pip_conf:
             return tmpl_val, tmpl_conf, "template"
         return pip_val, pip_conf, "pips"
-    if tmpl_conf >= 0.25 and tmpl_val > 0:         # weak template, no pip result
+    if tmpl_conf >= 0.38 and tmpl_val > 0:         # weak template, no pip result
         return tmpl_val, tmpl_conf, "template"
-    if pip_val > 0:
+    if pip_val > 0 and pip_conf >= 0.50:           # pip-only: require decent confidence
         return pip_val, pip_conf, "pips"
-    # Nothing definitive — return whichever method has more signal
-    if tmpl_conf > pip_conf:
-        return tmpl_val, tmpl_conf, "template?"
-    return pip_val, pip_conf, "pips?"
+    # Nothing confident enough — return 0 to avoid false positives
+    return 0, 0.0, "?"
 
 
 # ── Main analysis pipeline ────────────────────────────────────────────────────
@@ -751,9 +755,9 @@ class WebcamDialog(QDialog):
         self.auto_chk.setChecked(True)
         self.auto_slider = QSlider(Qt.Orientation.Horizontal)
         self.auto_slider.setRange(20, 90)
-        self.auto_slider.setValue(60)
+        self.auto_slider.setValue(65)
         self.auto_slider.setFixedWidth(110)
-        self.auto_thresh_lbl = QLabel('60%')
+        self.auto_thresh_lbl = QLabel('65%')
         self.auto_thresh_lbl.setFixedWidth(34)
         self.auto_slider.valueChanged.connect(
             lambda v: self.auto_thresh_lbl.setText(f'{v}%'))
