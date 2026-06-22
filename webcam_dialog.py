@@ -545,18 +545,50 @@ def _detect_die_value(roi) -> Tuple[int, float, str]:
     tmpl_val, tmpl_conf = _classify_roi(roi)
     pip_val,  pip_conf  = _count_pips(roi)
 
-    if tmpl_conf >= 0.48 and tmpl_val > 0:        # strong template hit
+    # Strong template match — trust it
+    if tmpl_conf >= 0.55 and tmpl_val > 0:
         return tmpl_val, tmpl_conf, "template"
-    if tmpl_val > 0 and pip_val > 0:               # both have signal — pick better
-        if tmpl_conf >= pip_conf:
+    # Both methods agree — high confidence even if individual scores are modest
+    if tmpl_val > 0 and pip_val > 0 and tmpl_val == pip_val:
+        combined = min(0.95, (tmpl_conf + pip_conf) / 2 + 0.10)
+        return tmpl_val, combined, "template+pips"
+    # Both have signal but disagree — pick the more confident one (higher bar)
+    if tmpl_val > 0 and pip_val > 0:
+        if tmpl_conf >= 0.52 and tmpl_conf >= pip_conf:
             return tmpl_val, tmpl_conf, "template"
-        return pip_val, pip_conf, "pips"
-    if tmpl_conf >= 0.38 and tmpl_val > 0:         # weak template, no pip result
+        if pip_conf >= 0.60:
+            return pip_val, pip_conf, "pips"
+    # Template only — need higher threshold since no pip confirmation
+    if tmpl_conf >= 0.52 and tmpl_val > 0:
         return tmpl_val, tmpl_conf, "template"
-    if pip_val > 0 and pip_conf >= 0.50:           # pip-only: require decent confidence
+    # Pip only — need decent confidence
+    if pip_val > 0 and pip_conf >= 0.60:
         return pip_val, pip_conf, "pips"
-    # Nothing confident enough — return 0 to avoid false positives
+    # Nothing reliable enough
     return 0, 0.0, "?"
+
+
+def _is_die_like(roi) -> bool:
+    """
+    Quick sanity checks before spending time on template matching.
+    Returns False for anything that clearly isn't a white/cream die face.
+    """
+    if roi is None or roi.size == 0:
+        return False
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
+    mean_brightness = float(np.mean(gray))
+    # Dice are white/cream — reject dark objects outright
+    if mean_brightness < 100:
+        return False
+    # Reject if image is nearly all black (e.g. shadow, cable)
+    bright_pixels = float(np.sum(gray > 80)) / gray.size
+    if bright_pixels < 0.40:
+        return False
+    # The background of a die face is mostly uniform — measure std dev
+    # A face with extreme variance is probably not a die
+    if float(np.std(gray)) > 90:
+        return False
+    return True
 
 
 # ── Main analysis pipeline ────────────────────────────────────────────────────
@@ -575,6 +607,11 @@ def _analyze_frame(frame) -> Tuple[List[Dict], List[Dict]]:
         x1, y1 = max(0, x-pad),   max(0, y-pad)
         x2, y2 = min(fw, x+rw+pad), min(fh, y+rh+pad)
         roi    = frame[y1:y2, x1:x2]
+
+        # Fast reject: must look like a white/bright die face
+        if not _is_die_like(roi):
+            continue
+
         val, conf, method = _detect_die_value(roi)
         candidates.append({'rect': (x, y, rw, rh), 'pips': val,
                            'conf': conf, 'method': method, 'area': rw*rh})
