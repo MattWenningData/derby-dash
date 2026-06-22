@@ -253,8 +253,7 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
 
     def _check(cnt):
         area = cv2.contourArea(cnt)
-        # Dice should be a reasonable size — not tiny noise, not huge objects
-        if not (fa * 0.003 <= area <= fa * 0.30):
+        if not (fa * 0.002 <= area <= fa * 0.35):
             return None
         peri = cv2.arcLength(cnt, True)
         if peri == 0:
@@ -262,18 +261,15 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
         rx, ry, rw, rh = cv2.boundingRect(cnt)
         if rh == 0:
             return None
-        # Dice are roughly square — allow slight rectangle for perspective/angle
-        if not (0.55 <= rw/rh <= 1.65):
+        if not (0.45 <= rw/rh <= 1.90):
             return None
-        # Must fill its bounding box well (rules out L-shapes, lines, blobs)
-        if area / (rw * rh) < 0.42:
+        if area / (rw * rh) < 0.30:
             return None
-        # Squareness bonus: contour must be roughly convex like a square
         hull_area = cv2.contourArea(cv2.convexHull(cnt))
-        if hull_area > 0 and area / hull_area < 0.60:
+        if hull_area > 0 and area / hull_area < 0.50:
             return None
         approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-        if not (4 <= len(approx) <= 8):
+        if not (3 <= len(approx) <= 12):
             return None
         return (rx, ry, rw, rh)
 
@@ -319,14 +315,39 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
             if r:
                 found.append(r)
 
-    # ── Method 4: HSV white-region detection (standard white/ivory dice) ──────
-    hsv   = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    lo    = np.array([0,   0, 150], dtype=np.uint8)
-    hi    = np.array([179, 70, 255], dtype=np.uint8)
-    wmask = cv2.inRange(hsv, lo, hi)
-    wmask = cv2.morphologyEx(wmask, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8), iterations=2)
-    wmask = cv2.morphologyEx(wmask, cv2.MORPH_OPEN,  np.ones((5, 5), np.uint8), iterations=1)
-    for cnt in cv2.findContours(wmask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)[0]:
+    # ── Method 4: HSV white-region detection ─────────────────────────────────
+    # Try two ranges: standard white dice and slightly off-white/cream dice
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+    for lo_v, hi_s in ((140, 80), (120, 100), (160, 55)):
+        lo = np.array([0,   0,   lo_v], dtype=np.uint8)
+        hi = np.array([179, hi_s, 255], dtype=np.uint8)
+        wmask = cv2.inRange(hsv, lo, hi)
+        wmask = cv2.morphologyEx(wmask, cv2.MORPH_CLOSE,
+                                 np.ones((9, 9), np.uint8), iterations=2)
+        wmask = cv2.morphologyEx(wmask, cv2.MORPH_OPEN,
+                                 np.ones((5, 5), np.uint8), iterations=1)
+        for cnt in cv2.findContours(wmask, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
+            r = _check(cnt)
+            if r:
+                found.append(r)
+
+    # ── Method 5: Bright-spot relative to surroundings ────────────────────────
+    # Finds regions brighter than their local neighbourhood — works when die
+    # colour is close to background but still slightly brighter.
+    kernel_size = max(31, min(fh, fw) // 12)
+    if kernel_size % 2 == 0:
+        kernel_size += 1
+    local_mean = cv2.GaussianBlur(gray.astype(np.float32),
+                                  (kernel_size, kernel_size), 0)
+    bright_rel = np.clip(gray.astype(np.float32) - local_mean + 30, 0, 255).astype(np.uint8)
+    _, bright_mask = cv2.threshold(bright_rel, 25, 255, cv2.THRESH_BINARY)
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE,
+                                   np.ones((11, 11), np.uint8), iterations=2)
+    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN,
+                                   np.ones((5,  5),  np.uint8), iterations=1)
+    for cnt in cv2.findContours(bright_mask, cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE)[0]:
         r = _check(cnt)
         if r:
             found.append(r)
