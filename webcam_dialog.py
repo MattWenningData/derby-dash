@@ -253,7 +253,7 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
 
     def _check(cnt):
         area = cv2.contourArea(cnt)
-        if not (fa * 0.002 <= area <= fa * 0.35):
+        if not (fa * 0.0005 <= area <= fa * 0.35):
             return None
         peri = cv2.arcLength(cnt, True)
         if peri == 0:
