@@ -195,7 +195,7 @@ def load_reference_images(folder: str) -> Tuple[int, str]:
 
 # ── NMS helper ────────────────────────────────────────────────────────────────
 
-def _nms(rects: List[Tuple[int,int,int,int]], iou_thresh: float = 0.40) \
+def _nms(rects: List[Tuple[int,int,int,int]], iou_thresh: float = 0.30) \
         -> List[Tuple[int,int,int,int]]:
     rects = sorted(set(rects), key=lambda r: r[2]*r[3], reverse=True)
     kept: List[Tuple[int,int,int,int]] = []
@@ -295,6 +295,21 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
             if r:
                 found.append(r)
 
+    # ── Method 4: Adaptive threshold — catches dice when local contrast is low ─
+    for block, c in ((21, 5), (35, 8)):
+        adapt = cv2.adaptiveThreshold(blur, 255,
+                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                      cv2.THRESH_BINARY, block, c)
+        adapt = cv2.morphologyEx(adapt, cv2.MORPH_OPEN,
+                                 np.ones((3,3), np.uint8), iterations=1)
+        adapt = cv2.morphologyEx(adapt, cv2.MORPH_CLOSE,
+                                 np.ones((5,5), np.uint8), iterations=2)
+        for cnt in cv2.findContours(adapt, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
+            r = _check(cnt)
+            if r:
+                found.append(r)
+
     return _nms(found)
 
 
@@ -371,9 +386,10 @@ def _match_orb(roi) -> Tuple[int, float]:
 
 def _count_pips(roi) -> Tuple[int, float]:
     """
-    Count pips via connected-component analysis.
-    More reliable than blob/Hough under varying lighting.
-    Returns (value, confidence 0-1).
+    Count pips using three methods with majority vote:
+      1. Connected components on Otsu-INV threshold (dark pips → white blobs)
+      2. Connected components on Otsu threshold (second polarity, backup)
+      3. Black-hat morphology (finds dark pips regardless of Otsu polarity — best for "3")
     """
     if not OPENCV_AVAILABLE or roi is None or roi.size == 0:
         return 0, 0.0
@@ -385,20 +401,15 @@ def _count_pips(roi) -> Tuple[int, float]:
     h, w = gray.shape
     b    = max(3, int(min(h, w) * 0.08))
     roi_area = h * w
-    min_pip  = max(8,  roi_area * 0.006)
-    max_pip  = max(min_pip + 1, roi_area * 0.10)
+    min_pip  = max(6,  roi_area * 0.003)   # lowered from 0.006 — catches smaller/closer pips
+    max_pip  = max(min_pip + 1, roi_area * 0.12)
 
-    votes = []
-
-    for inv in (True, False):
-        flags = (cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU if inv
-                 else cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, thr = cv2.threshold(gray, 0, 255, flags)
-        thr[:b, :] = thr[-b:, :] = thr[:, :b] = thr[:, -b:] = 0
-        thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
+    def _cc_count(thr_img):
+        img = thr_img.copy()
+        img[:b, :] = img[-b:, :] = img[:, :b] = img[:, -b:] = 0
+        img = cv2.morphologyEx(img, cv2.MORPH_OPEN,
                                cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-
-        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(thr)
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(img)
         count = 0
         for i in range(1, n_labels):
             a  = int(stats[i, cv2.CC_STAT_AREA])
@@ -408,22 +419,42 @@ def _count_pips(roi) -> Tuple[int, float]:
             cy = int(stats[i, cv2.CC_STAT_TOP])  + ch // 2
             if not (min_pip <= a <= max_pip):
                 continue
-            if ch == 0 or not (0.35 <= cw / ch <= 2.80):
+            if ch == 0 or not (0.30 <= cw / ch <= 3.20):
                 continue
-            if (cw * ch) > 0 and a / (cw * ch) < 0.30:
+            if (cw * ch) > 0 and a / (cw * ch) < 0.25:
                 continue
-            # Must not be on the border
             if cx < b or cx > w - b or cy < b or cy > h - b:
                 continue
             count += 1
+        return count
 
-        if 1 <= count <= 6:
-            votes.append(count)
+    votes = []
+
+    # Method 1 & 2: Otsu both polarities
+    for inv in (True, False):
+        flags = (cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU if inv
+                 else cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        _, thr = cv2.threshold(gray, 0, 255, flags)
+        c = _cc_count(thr)
+        if 1 <= c <= 6:
+            votes.append(c)
+
+    # Method 3: black-hat morphology — finds dark blobs on bright background
+    # especially reliable for "3" (diagonal pips) and any die under flat lighting
+    k_size = max(5, min(h, w) // 4)
+    if k_size % 2 == 0:
+        k_size += 1
+    kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
+    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    _, bh_thr = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    bh_count = _cc_count(bh_thr)
+    if 1 <= bh_count <= 6:
+        votes.append(bh_count)
 
     if not votes:
         return 0, 0.0
     winner, freq = Counter(votes).most_common(1)[0]
-    conf = {2: 0.88, 1: 0.65}.get(freq, 0.65)
+    conf = {3: 0.92, 2: 0.82, 1: 0.65}.get(freq, 0.65)
     return winner, conf
 
 
@@ -489,45 +520,6 @@ def _analyze_frame(frame) -> Tuple[List[Dict], List[Dict]]:
             detections.append({'value': val, 'conf': conf,
                                'method': method, 'rect': (x, y, rw, rh)})
 
-    detections.sort(key=lambda d: d['conf'], reverse=True)
-    top2 = detections[:2]
-    top2.sort(key=lambda d: d['rect'][0])
-    candidates.sort(key=lambda d: d['rect'][0])
-    return top2, candidates
-
-
-# ── Confidence bar widget ─────────────────────────────────────────────────────
-
-
-# ── Main analysis pipeline ────────────────────────────────────────────────────
-
-def _analyze_frame(frame) -> Tuple[List[Dict], List[Dict]]:
-    if not OPENCV_AVAILABLE or frame is None:
-        return [], []
-
-    fh, fw        = frame.shape[:2]
-    cand_rects    = _find_die_candidates(frame)
-    detections:  List[Dict] = []
-    candidates:  List[Dict] = []
-
-    for (x, y, rw, rh) in cand_rects:
-        pad    = max(4, int(min(rw, rh) * 0.06))
-        x1, y1 = max(0, x-pad),   max(0, y-pad)
-        x2, y2 = min(fw, x+rw+pad), min(fh, y+rh+pad)
-        roi    = frame[y1:y2, x1:x2]
-
-        # Fast reject: must look like a white/bright die face
-        if not _is_die_like(roi):
-            continue
-
-        val, conf, method = _detect_die_value(roi)
-        candidates.append({'rect': (x, y, rw, rh), 'pips': val,
-                           'conf': conf, 'method': method, 'area': rw*rh})
-        if 1 <= val <= 6:
-            detections.append({'value': val, 'conf': conf,
-                               'method': method, 'rect': (x, y, rw, rh)})
-
-    # Auto-select top-2 by confidence, then re-sort left-to-right (left die first)
     detections.sort(key=lambda d: d['conf'], reverse=True)
     top2 = detections[:2]
     top2.sort(key=lambda d: d['rect'][0])
