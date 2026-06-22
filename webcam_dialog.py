@@ -270,7 +270,7 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
             return None
         # Squareness bonus: contour must be roughly convex like a square
         hull_area = cv2.contourArea(cv2.convexHull(cnt))
-        if hull_area > 0 and area / hull_area < 0.70:
+        if hull_area > 0 and area / hull_area < 0.60:
             return None
         approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
         if not (4 <= len(approx) <= 8):
@@ -582,23 +582,23 @@ def _is_die_like(roi) -> bool:
         return False
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
     mean_brightness = float(np.mean(gray))
-    # Dice are white/cream — reject dark objects outright
-    if mean_brightness < 100:
+    # Dice are white/cream — reject clearly dark objects
+    if mean_brightness < 85:
         return False
-    # Reject if image is nearly all black (e.g. shadow, cable)
-    bright_pixels = float(np.sum(gray > 80)) / gray.size
-    if bright_pixels < 0.40:
+    # Must not be nearly all black
+    bright_pixels = float(np.sum(gray > 70)) / gray.size
+    if bright_pixels < 0.35:
         return False
     std = float(np.std(gray))
-    # A blank white surface (paper, wall) has std ~2-8 — reject it.
-    # A heavily textured background has std > 85 — also reject.
-    # A real die face has std ~12-70 (bright background + dark pips).
-    if not (10 <= std <= 80):
+    # Reject only very extreme cases:
+    # - Nearly uniform solid colour (std < 5): blank wall/paper with no pips
+    # - Wildly complex texture (std > 95): tablecloth, carpet, etc.
+    if std < 5 or std > 95:
         return False
-    # Must have at least a few dark pixels (the pips) relative to the mean.
-    # A die face with 1 pip on white will have ~3-4% dark pixels.
-    dark_pixels = float(np.sum(gray < mean_brightness * 0.65)) / gray.size
-    if dark_pixels < 0.02:
+    # Must have some dark pixels relative to the mean — the pips.
+    # A die face always has at least 1 pip (~1% dark area minimum).
+    dark_pixels = float(np.sum(gray < mean_brightness * 0.70)) / gray.size
+    if dark_pixels < 0.008:
         return False
     return True
 
