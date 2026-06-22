@@ -4,16 +4,12 @@ Webcam-based dice reader for Derby Dash.
 
 Detection pipeline
 ──────────────────
-1.  _find_die_candidates()  – multi-method (Canny / Otsu / adaptive) rectangle
+1.  _find_die_candidates()  – multi-method (HSV / Canny / Otsu) rectangle
                               detection to locate each die face in the frame.
-2.  _classify_roi()         – if reference photos were loaded, compare the ROI
-                              against augmented templates using normalised
-                              cross-correlation (NCC).  This is the primary
-                              classifier because it knows exactly what THESE
-                              dice look like.
-3.  _count_pips()           – fallback: blob/contour/Hough pip counting.
-4.  Combined result:        – template result wins when NCC confidence ≥ 0.50;
-                              falls back to pip count when confidence is lower.
+2.  _match_orb()            – ORB feature matching against reference photos.
+                              Primary classifier when reference images are loaded.
+3.  _count_pips()           – fallback: connected-component pip counting.
+4.  _detect_die_value()     – combines ORB + pip results; boost when they agree.
 """
 from __future__ import annotations
 
@@ -44,23 +40,21 @@ except ImportError:
 _DEFAULT_TEMPLATE_DIR = r"C:\Users\mattwenning\Pictures\Camera Roll"
 _TEMPLATE_SIZE        = (64, 64)
 
-# Module-level stores populated by load_reference_images()
-_TEMPLATES:     Dict[int, List] = {}   # {face: [36 augmented 64×64 grayscale imgs]}
-_HOG_FEATURES:  Dict[int, List] = {}   # {face: [36 flattened HOG vectors]}
+# Module-level stores — populated by load_reference_images()
+_REF_IMGS:    Dict[int, np.ndarray] = {}   # {face: 64×64 gray reference image}
+_ORB_FEATS:   Dict[int, list]       = {}   # {face: [(kp, des), ...]} rotated variants
 _TEMPLATE_SOURCE: str = ""
 
+_ORB_INST = None
 
-# ── HOG descriptor (shared, lazy-initialised) ─────────────────────────────────
-
-_HOG_DESC = None
-
-def _get_hog():
-    global _HOG_DESC
-    if _HOG_DESC is None and OPENCV_AVAILABLE:
-        _HOG_DESC = cv2.HOGDescriptor(
-            _winSize=(64, 64), _blockSize=(16, 16), _blockStride=(8, 8),
-            _cellSize=(8, 8),  _nbins=9)
-    return _HOG_DESC
+def _get_orb():
+    global _ORB_INST
+    if _ORB_INST is None and OPENCV_AVAILABLE:
+        _ORB_INST = cv2.ORB_create(nfeatures=500, scaleFactor=1.2, nlevels=8,
+                                    edgeThreshold=10, firstLevel=0, WTA_K=2,
+                                    scoreType=cv2.ORB_HARRIS_SCORE,
+                                    patchSize=31, fastThreshold=15)
+    return _ORB_INST
 
 
 # ── Webcam config (persists default camera selection) ─────────────────────────
@@ -87,83 +81,63 @@ def _save_webcam_config(data: Dict) -> None:
         pass
 
 
-# ── Template loading ──────────────────────────────────────────────────────────
+# ── Reference image loading ───────────────────────────────────────────────────
 
-def _crop_die_face(img) -> Optional[object]:
-    """
-    Try to locate the die face in a reference photo.
-    Returns a BGR crop if found, otherwise the whole image.
-    """
-    candidates = _find_die_candidates(img)
-    if not candidates:
-        h, w = img.shape[:2]
-        side = min(h, w)
-        cy, cx = h // 2, w // 2
-        return img[cy - side//2 : cy + side//2, cx - side//2 : cx + side//2]
-    # Use the largest candidate (most likely to be the die face)
-    best = max(candidates, key=lambda r: r[2] * r[3])
-    x, y, bw, bh = best
-    fh, fw = img.shape[:2]
-    pad = max(4, int(min(bw, bh) * 0.06))
-    return img[max(0, y-pad):min(fh, y+bh+pad), max(0, x-pad):min(fw, x+bw+pad)]
-
-
-def _normalize_die_patch(gray) -> np.ndarray:
-    """
-    Lighting-invariant normalization: min-max stretch + bilateral smoothing.
-    This makes live frames look much closer to reference photos regardless of
-    ambient light level.
-    """
-    # Min-max stretch to full 0-255 range
+def _prep_gray(img) -> np.ndarray:
+    """Normalize a die-face image for consistent matching."""
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if img.ndim == 3 else img.copy()
+    gray = cv2.resize(gray, _TEMPLATE_SIZE)
+    # Bilateral filter preserves pip edges while smoothing noise
+    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=50, sigmaSpace=50)
+    # Min-max stretch — makes lighting differences less impactful
     mn, mx = float(gray.min()), float(gray.max())
     if mx > mn:
-        gray = np.clip((gray.astype(np.float32) - mn) / (mx - mn) * 255, 0, 255).astype(np.uint8)
-    # Bilateral filter: smooths noise but keeps pip edges sharp
-    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=40, sigmaSpace=40)
+        gray = np.clip((gray.astype(np.float32) - mn) / (mx - mn) * 255,
+                       0, 255).astype(np.uint8)
     return gray
 
 
-def _edge_map(gray64) -> np.ndarray:
-    """Canny edge map of a 64×64 patch, normalized 0-255."""
-    edges = cv2.Canny(gray64, 20, 80)
-    return edges
-
-
-def _augment_template(gray64) -> List:
-    """
-    Generate 54 augmented 64×64 grayscale variants per die face:
-    9 rotations (every 40°) × 3 brightness × 2 (original + edge-normalized).
-    Edge-normalized variants allow lighting-invariant matching.
-    """
-    results = []
-    for angle in range(0, 360, 40):          # 9 rotations
-        if angle == 0:
-            rot = gray64
-        else:
-            M   = cv2.getRotationMatrix2D((32, 32), float(angle), 1.0)
-            rot = cv2.warpAffine(gray64, M, _TEMPLATE_SIZE)
-        for alpha in (0.70, 1.0, 1.35):      # dark / normal / bright
-            adj = np.clip(rot.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
-            results.append(adj)
-            # Also add an edge-map variant for lighting-invariant matching
-            results.append(_edge_map(adj))
-    return results   # 54 variants (9 × 3 × 2)
+def _crop_to_die(img):
+    """Try to isolate the die face in a reference photo using HSV white detection."""
+    if not OPENCV_AVAILABLE:
+        return img
+    hsv   = cv2.cvtColor(img, cv2.COLOR_BGR2HSV)
+    lo    = np.array([0,   0, 130], dtype=np.uint8)
+    hi    = np.array([179, 80, 255], dtype=np.uint8)
+    mask  = cv2.inRange(hsv, lo, hi)
+    mask  = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, np.ones((11, 11), np.uint8), iterations=2)
+    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return img
+    fh, fw = img.shape[:2]
+    fa = fh * fw
+    candidates = []
+    for cnt in cnts:
+        a = cv2.contourArea(cnt)
+        if not (fa * 0.01 <= a <= fa * 0.95):
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        if h == 0 or not (0.5 <= w/h <= 2.0):
+            continue
+        candidates.append((a, x, y, w, h))
+    if not candidates:
+        return img
+    _, x, y, w, h = max(candidates, key=lambda t: t[0])
+    pad = max(4, int(min(w, h) * 0.05))
+    return img[max(0, y-pad):min(fh, y+h+pad), max(0, x-pad):min(fw, x+w+pad)]
 
 
 def load_reference_images(folder: str) -> Tuple[int, str]:
     """
-    Scan *folder* for files named 1–6 (any image extension), load each,
-    try to crop the die face, apply CLAHE, resize to 64×64, and build
-    augmented template banks.
-
-    Returns (n_loaded, status_message).
+    Load reference images (1.jpg–6.jpg), crop to die face, and build
+    ORB feature banks (4 rotations × augmented brightness per face).
     """
     global _TEMPLATE_SOURCE
-    _TEMPLATES.clear()
-    _HOG_FEATURES.clear()
+    _REF_IMGS.clear()
+    _ORB_FEATS.clear()
 
     if not OPENCV_AVAILABLE:
-        return 0, "OpenCV not available — templates not loaded"
+        return 0, "OpenCV not available"
 
     p = Path(folder)
     if not p.is_dir():
@@ -172,15 +146,15 @@ def load_reference_images(folder: str) -> Tuple[int, str]:
     extensions = (".jpg", ".jpeg", ".png", ".bmp", ".tiff", ".tif",
                   ".JPG", ".JPEG", ".PNG", ".BMP")
     loaded = 0
+    orb    = _get_orb()
 
     for value in range(1, 7):
         img_path: Optional[Path] = None
         for ext in extensions:
-            candidate = p / f"{value}{ext}"
-            if candidate.exists():
-                img_path = candidate
+            c = p / f"{value}{ext}"
+            if c.exists():
+                img_path = c
                 break
-
         if img_path is None:
             continue
 
@@ -188,34 +162,40 @@ def load_reference_images(folder: str) -> Tuple[int, str]:
         if img is None:
             continue
 
-        crop = _crop_die_face(img)
-        if crop is None or crop.size == 0:
-            continue
+        crop = _crop_to_die(img)
+        gray = _prep_gray(crop)
+        _REF_IMGS[value] = gray
 
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        gray = _normalize_die_patch(gray)
-        gray = cv2.resize(gray, _TEMPLATE_SIZE)
-
-        _TEMPLATES[value] = _augment_template(gray)
-
-        # Pre-compute HOG only for intensity templates (every other, at indices 0,2,4,...)
-        hog = _get_hog()
-        if hog:
-            _HOG_FEATURES[value] = [
-                hog.compute(_TEMPLATES[value][i]).flatten()
-                for i in range(0, len(_TEMPLATES[value]), 2)
-            ]
+        # Build ORB features for 4 rotations × 3 brightness levels = 12 variants
+        if orb:
+            variants = []
+            for angle in (0, 90, 180, 270):
+                if angle:
+                    M   = cv2.getRotationMatrix2D((32, 32), float(angle), 1.0)
+                    rot = cv2.warpAffine(gray, M, _TEMPLATE_SIZE)
+                else:
+                    rot = gray
+                for alpha in (0.75, 1.0, 1.30):
+                    adj = np.clip(rot.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
+                    try:
+                        kp, des = orb.detectAndCompute(adj, None)
+                        if des is not None and len(des) >= 4:
+                            variants.append((kp, des))
+                    except Exception:
+                        pass
+            if variants:
+                _ORB_FEATS[value] = variants
         loaded += 1
 
     _TEMPLATE_SOURCE = str(p) if loaded else ""
-    status = (f"{loaded}/6 dice templates + HOG features loaded from ...{p.name}"
-              if loaded else "No template images found in selected folder")
+    status = (f"{loaded}/6 reference images loaded (ORB features ready)"
+              if loaded else "No reference images found")
     return loaded, status
 
 
 # ── NMS helper ────────────────────────────────────────────────────────────────
 
-def _nms(rects: List[Tuple[int,int,int,int]], iou_thresh: float = 0.35) \
+def _nms(rects: List[Tuple[int,int,int,int]], iou_thresh: float = 0.40) \
         -> List[Tuple[int,int,int,int]]:
     rects = sorted(set(rects), key=lambda r: r[2]*r[3], reverse=True)
     kept: List[Tuple[int,int,int,int]] = []
@@ -231,29 +211,34 @@ def _nms(rects: List[Tuple[int,int,int,int]], iou_thresh: float = 0.35) \
             if ix2 <= ix1 or iy2 <= iy1:
                 survivors.append(r)
                 continue
-            inter  = (ix2-ix1)*(iy2-iy1)
-            union  = bw*bh + rw*rh - inter
+            inter = (ix2-ix1) * (iy2-iy1)
+            union = bw*bh + rw*rh - inter
             if union <= 0 or inter/union < iou_thresh:
                 survivors.append(r)
         rects = survivors
     return kept
 
 
-# ── Die face detection ────────────────────────────────────────────────────────
+# ── Die localization ──────────────────────────────────────────────────────────
 
 def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
+    """
+    Locate die-face rectangles using three complementary approaches:
+      1. HSV white/bright region isolation
+      2. Canny edges at two sigma levels
+      3. Otsu threshold (both polarities)
+    Geometry filter is deliberately permissive — downstream classifiers
+    reject non-dice based on appearance, not shape alone.
+    """
     fh, fw = frame.shape[:2]
-    fa   = fh * fw
-    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(8, 8))
-    gray  = clahe.apply(gray)
-    blur  = cv2.GaussianBlur(gray, (5, 5), 0)
-
+    fa     = fh * fw
+    gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    blur   = cv2.GaussianBlur(gray, (5, 5), 0)
     found: List[Tuple[int,int,int,int]] = []
 
     def _check(cnt):
         area = cv2.contourArea(cnt)
-        if not (fa * 0.0005 <= area <= fa * 0.35):
+        if not (fa * 0.0004 <= area <= fa * 0.40):
             return None
         peri = cv2.arcLength(cnt, True)
         if peri == 0:
@@ -261,299 +246,185 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
         rx, ry, rw, rh = cv2.boundingRect(cnt)
         if rh == 0:
             return None
-        if not (0.45 <= rw/rh <= 1.90):
+        if not (0.40 <= rw/rh <= 2.20):
             return None
-        if area / (rw * rh) < 0.30:
-            return None
-        hull_area = cv2.contourArea(cv2.convexHull(cnt))
-        if hull_area > 0 and area / hull_area < 0.50:
-            return None
-        approx = cv2.approxPolyDP(cnt, 0.04 * peri, True)
-        if not (3 <= len(approx) <= 12):
+        if area / (rw * rh) < 0.25:
             return None
         return (rx, ry, rw, rh)
 
-    # Canny at three sigma levels
-    median = float(np.median(blur))
-    for sigma in (0.25, 0.4, 0.6):
-        lo = max(10, int(median * (1 - sigma)))
-        hi = min(255, int(median * (1 + sigma)))
-        edges = cv2.Canny(blur, lo, hi)
-        edges = cv2.dilate(edges, np.ones((3, 3), np.uint8), iterations=1)
-        for cnt in cv2.findContours(edges, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
-            r = _check(cnt)
-            if r:
-                found.append(r)
-
-    # Global Otsu — both polarities
-    for flags in (cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU):
-        _, binary = cv2.threshold(blur, 0, 255, flags)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE,
-                                  np.ones((7, 7), np.uint8), iterations=2)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
-                                  np.ones((3, 3), np.uint8), iterations=1)
-        for cnt in cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
-            r = _check(cnt)
-            if r:
-                found.append(r)
-
-    # Adaptive threshold — three block sizes
-    for block, c in ((21, 5), (31, 8), (11, 3)):
-        adapt = cv2.adaptiveThreshold(blur, 255,
-                                       cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                       cv2.THRESH_BINARY, block, c)
-        adapt = cv2.morphologyEx(adapt, cv2.MORPH_OPEN,
-                                 np.ones((3, 3), np.uint8), iterations=1)
-        adapt = cv2.morphologyEx(adapt, cv2.MORPH_CLOSE,
-                                 np.ones((5, 5), np.uint8), iterations=2)
-        for cnt in cv2.findContours(adapt, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
-            r = _check(cnt)
-            if r:
-                found.append(r)
-
-    # ── Method 4: HSV white-region detection ─────────────────────────────────
-    # Try two ranges: standard white dice and slightly off-white/cream dice
+    # ── Method 1: HSV white/cream isolation ──────────────────────────────────
     hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    for lo_v, hi_s in ((140, 80), (120, 100), (160, 55)):
-        lo = np.array([0,   0,   lo_v], dtype=np.uint8)
-        hi = np.array([179, hi_s, 255], dtype=np.uint8)
+    for lo_v, hi_s in ((130, 90), (110, 110), (150, 65)):
+        lo    = np.array([0,   0,   lo_v], dtype=np.uint8)
+        hi    = np.array([179, hi_s, 255], dtype=np.uint8)
         wmask = cv2.inRange(hsv, lo, hi)
         wmask = cv2.morphologyEx(wmask, cv2.MORPH_CLOSE,
-                                 np.ones((9, 9), np.uint8), iterations=2)
+                                 np.ones((9,9), np.uint8), iterations=2)
         wmask = cv2.morphologyEx(wmask, cv2.MORPH_OPEN,
-                                 np.ones((5, 5), np.uint8), iterations=1)
+                                 np.ones((5,5), np.uint8), iterations=1)
         for cnt in cv2.findContours(wmask, cv2.RETR_EXTERNAL,
                                     cv2.CHAIN_APPROX_SIMPLE)[0]:
             r = _check(cnt)
             if r:
                 found.append(r)
 
-    # ── Method 5: Bright-spot relative to surroundings ────────────────────────
-    # Finds regions brighter than their local neighbourhood — works when die
-    # colour is close to background but still slightly brighter.
-    kernel_size = max(31, min(fh, fw) // 12)
-    if kernel_size % 2 == 0:
-        kernel_size += 1
-    local_mean = cv2.GaussianBlur(gray.astype(np.float32),
-                                  (kernel_size, kernel_size), 0)
-    bright_rel = np.clip(gray.astype(np.float32) - local_mean + 30, 0, 255).astype(np.uint8)
-    _, bright_mask = cv2.threshold(bright_rel, 25, 255, cv2.THRESH_BINARY)
-    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_CLOSE,
-                                   np.ones((11, 11), np.uint8), iterations=2)
-    bright_mask = cv2.morphologyEx(bright_mask, cv2.MORPH_OPEN,
-                                   np.ones((5,  5),  np.uint8), iterations=1)
-    for cnt in cv2.findContours(bright_mask, cv2.RETR_EXTERNAL,
-                                cv2.CHAIN_APPROX_SIMPLE)[0]:
-        r = _check(cnt)
-        if r:
-            found.append(r)
+    # ── Method 2: Canny edges ─────────────────────────────────────────────────
+    median = float(np.median(blur))
+    for sigma in (0.30, 0.55):
+        lo_c = max(10, int(median * (1 - sigma)))
+        hi_c = min(255, int(median * (1 + sigma)))
+        edges = cv2.Canny(blur, lo_c, hi_c)
+        edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
+        for cnt in cv2.findContours(edges, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
+            r = _check(cnt)
+            if r:
+                found.append(r)
+
+    # ── Method 3: Otsu threshold ──────────────────────────────────────────────
+    for flags in (cv2.THRESH_BINARY + cv2.THRESH_OTSU,
+                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU):
+        _, binary = cv2.threshold(blur, 0, 255, flags)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE,
+                                  np.ones((7,7), np.uint8), iterations=2)
+        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
+                                  np.ones((3,3), np.uint8), iterations=1)
+        for cnt in cv2.findContours(binary, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
+            r = _check(cnt)
+            if r:
+                found.append(r)
 
     return _nms(found)
 
 
-# ── Template-based classification ─────────────────────────────────────────────
+# ── Die face sanity check ─────────────────────────────────────────────────────
 
-def _classify_roi(roi) -> Tuple[int, float]:
+def _is_die_like(roi) -> bool:
+    """Return True only if the ROI plausibly contains a white/cream die face."""
+    if roi is None or roi.size == 0:
+        return False
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
+    mean_b = float(np.mean(gray))
+    if mean_b < 80:                                          # too dark
+        return False
+    if float(np.sum(gray > 65)) / gray.size < 0.30:         # mostly black
+        return False
+    std = float(np.std(gray))
+    if std < 4 or std > 100:                                 # blank or chaotic
+        return False
+    # Must have some dark pixels (the pips)
+    if float(np.sum(gray < mean_b * 0.72)) / gray.size < 0.006:
+        return False
+    return True
+
+
+# ── ORB-based classifier ──────────────────────────────────────────────────────
+
+def _match_orb(roi) -> Tuple[int, float]:
     """
-    Multi-method template matching:
-      - NCC on normalized intensity patch (good when lighting matches)
-      - NCC on edge map (lighting invariant)
-      - HOG cosine similarity (structure/shape invariant)
-    All three are combined; best-matching face value wins.
+    Match live ROI against pre-computed ORB features of all 6 reference faces.
+    Returns (best_value, confidence 0-1).
+    Uses Lowe's ratio test; confidence = good_matches / target_matches.
     """
-    if not _TEMPLATES or roi is None or roi.size == 0:
+    orb = _get_orb()
+    if not orb or not _ORB_FEATS or roi is None or roi.size == 0:
         return 0, 0.0
-    if min(roi.shape[:2]) < 18:
+    if min(roi.shape[:2]) < 20:
         return 0, 0.0
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi.copy()
-    gray = _normalize_die_patch(gray)
-    gray = cv2.resize(gray, _TEMPLATE_SIZE)
+    gray = _prep_gray(roi if roi.ndim == 3 else
+                      cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR))
 
-    # Edge map of live ROI — lighting invariant
-    roi_edges = _edge_map(gray)
+    try:
+        kp2, des2 = orb.detectAndCompute(gray, None)
+    except Exception:
+        return 0, 0.0
+    if des2 is None or len(des2) < 4:
+        return 0, 0.0
 
-    # HOG of live ROI
-    hog          = _get_hog()
-    roi_hog      = None
-    roi_hog_norm = 0.0
-    if hog and _HOG_FEATURES:
-        try:
-            roi_hog      = hog.compute(gray).flatten()
-            roi_hog_norm = float(np.linalg.norm(roi_hog))
-        except Exception:
-            roi_hog = None
+    bf = cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
+    best_val, best_conf = 0, 0.0
 
-    best_val, best_score = 0, -1.0
+    for value, variants in _ORB_FEATS.items():
+        val_good = 0
+        for (kp1, des1) in variants:
+            try:
+                raw = bf.knnMatch(des1, des2, k=2)
+                for pair in raw:
+                    if len(pair) == 2:
+                        m, n = pair
+                        if m.distance < 0.75 * n.distance:
+                            val_good += 1
+            except Exception:
+                continue
+        # Normalise: 12 good matches = 100% confidence (empirical target)
+        conf = min(1.0, val_good / 12.0)
+        if conf > best_conf:
+            best_conf, best_val = conf, value
 
-    for value, tmpls in _TEMPLATES.items():
-        hog_feats = _HOG_FEATURES.get(value, [])
-        val_score = -1.0
-
-        # Templates alternate: [intensity_0, edge_0, intensity_1, edge_1, ...]
-        for i in range(0, len(tmpls), 2):
-            tmpl_intensity = tmpls[i]
-            tmpl_edge      = tmpls[i + 1] if i + 1 < len(tmpls) else None
-
-            ncc_intensity = float(cv2.matchTemplate(
-                gray, tmpl_intensity, cv2.TM_CCOEFF_NORMED)[0, 0])
-
-            ncc_edge = 0.0
-            if tmpl_edge is not None:
-                ncc_edge = float(cv2.matchTemplate(
-                    roi_edges, tmpl_edge, cv2.TM_CCOEFF_NORMED)[0, 0])
-
-            # HOG similarity (use the intensity template's HOG features)
-            hog_sim = 0.0
-            hog_idx = i // 2  # every other template pair shares a HOG index
-            if (roi_hog is not None and roi_hog_norm > 1e-8
-                    and hog_idx < len(hog_feats)):
-                hf      = hog_feats[hog_idx]
-                hf_norm = float(np.linalg.norm(hf))
-                if hf_norm > 1e-8:
-                    hog_sim = float(np.dot(roi_hog, hf)) / (roi_hog_norm * hf_norm)
-
-            # Weighted combination: intensity 45% + edge 35% + HOG 20%
-            # Edge NCC is most lighting-invariant so gets strong weight
-            score = 0.45 * ncc_intensity + 0.35 * ncc_edge + 0.20 * hog_sim
-
-            if score > val_score:
-                val_score = score
-
-        if val_score > best_score:
-            best_score, best_val = val_score, value
-
-    return best_val, max(0.0, best_score)
+    return best_val, best_conf
 
 
-# ── Pip counting (fallback) ───────────────────────────────────────────────────
-
-def _count_pips_in_mask(mask, border: int, h: int, w: int) -> int:
-    roi_area = h * w
-    min_pip  = max(8, roi_area * 0.0012)
-    max_pip  = max(min_pip + 1, roi_area * 0.09)
-
-    p = cv2.SimpleBlobDetector_Params()
-    p.filterByArea        = True;  p.minArea       = min_pip; p.maxArea = max_pip
-    p.filterByCircularity = True;  p.minCircularity = 0.30
-    p.filterByColor       = True;  p.blobColor     = 255
-    p.filterByConvexity   = False; p.filterByInertia = False
-    kps = cv2.SimpleBlobDetector_create(p).detect(mask)
-    c_blob = sum(1 for kp in kps
-                 if (border < kp.pt[0] - kp.size/2 and kp.pt[0] + kp.size/2 < w - border and
-                     border < kp.pt[1] - kp.size/2 and kp.pt[1] + kp.size/2 < h - border))
-
-    cnts, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    c_cnt = 0
-    for cnt in cnts:
-        a = cv2.contourArea(cnt)
-        if not (min_pip <= a <= max_pip):
-            continue
-        peri = cv2.arcLength(cnt, True)
-        if peri == 0:
-            continue
-        if (4 * 3.14159 * a / peri**2) < 0.28:
-            continue
-        rx, ry, rw, rh = cv2.boundingRect(cnt)
-        if (border < rx and rx+rw < w-border and border < ry and ry+rh < h-border):
-            c_cnt += 1
-
-    min_r   = max(2, min(h, w) // 20)
-    max_r   = max(min_r + 2, min(h, w) // 5)
-    circles = cv2.HoughCircles(mask, cv2.HOUGH_GRADIENT, dp=1.2,
-                               minDist=max(min_r * 2, 5), param1=25, param2=8,
-                               minRadius=min_r, maxRadius=max_r)
-    c_hough = 0
-    if circles is not None:
-        c_hough = sum(1 for c in circles[0]
-                      if (border < c[0]-c[2] and c[0]+c[2] < w-border and
-                          border < c[1]-c[2] and c[1]+c[2] < h-border))
-
-    votes = [v for v in (c_blob, c_cnt, c_hough) if 1 <= v <= 6]
-    if not votes:
-        return 0, 0
-    winner, freq = Counter(votes).most_common(1)[0]
-    return winner, freq          # (value, number_of_methods_that_agreed)
-
-
-def _count_pips_blackhat(gray: np.ndarray, b: int) -> int:
-    """
-    Morphological black-hat: finds dark blobs (pips) on a bright background.
-    More robust than blob/Hough under uneven lighting.
-    Works for dark pips on white/ivory dice.
-    """
-    h, w   = gray.shape
-    k_size = max(5, min(h, w) // 5)
-    if k_size % 2 == 0:
-        k_size += 1
-    kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    _, thr   = cv2.threshold(blackhat, 22, 255, cv2.THRESH_BINARY)
-    thr[:b, :] = thr[-b:, :] = thr[:, :b] = thr[:, -b:] = 0
-    thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
-
-    roi_area = h * w
-    min_pip  = max(6, roi_area * 0.001)
-    max_pip  = max(min_pip + 1, roi_area * 0.07)
-    cnts, _  = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    count = 0
-    for cnt in cnts:
-        a = cv2.contourArea(cnt)
-        if not (min_pip <= a <= max_pip):
-            continue
-        peri = cv2.arcLength(cnt, True)
-        if peri > 0 and (4 * 3.14159 * a / peri**2) > 0.28:
-            count += 1
-    return count
-
+# ── Pip counting (connected components) ──────────────────────────────────────
 
 def _count_pips(roi) -> Tuple[int, float]:
     """
-    Count pips using 4 methods with majority vote:
-      1. SimpleBlobDetector  2. Contour filter  3. HoughCircles  4. Black-hat morphology
-    Confidence reflects agreement: 4/4→0.95 | 3/4→0.82 | 2/4→0.60 | 1/4→0.40
+    Count pips via connected-component analysis.
+    More reliable than blob/Hough under varying lighting.
+    Returns (value, confidence 0-1).
     """
     if not OPENCV_AVAILABLE or roi is None or roi.size == 0:
         return 0, 0.0
-    if min(roi.shape[:2]) < 18:
+    if min(roi.shape[:2]) < 20:
         return 0, 0.0
 
-    gray  = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    gray  = clahe.apply(gray)
-    gray  = cv2.GaussianBlur(gray, (3, 3), 0)
-    h, w  = gray.shape
-    b     = max(3, int(min(h, w) * 0.09))
-    _CONF = {4: 0.95, 3: 0.82, 2: 0.60, 1: 0.40}
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi.copy()
+    gray = cv2.bilateralFilter(gray, 7, 50, 50)
+    h, w = gray.shape
+    b    = max(3, int(min(h, w) * 0.08))
+    roi_area = h * w
+    min_pip  = max(8,  roi_area * 0.006)
+    max_pip  = max(min_pip + 1, roi_area * 0.10)
+
+    votes = []
 
     for inv in (True, False):
         flags = (cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU if inv
                  else cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, mask = cv2.threshold(gray, 0, 255, flags)
-        mask[:b, :] = mask[-b:, :] = mask[:, :b] = mask[:, -b:] = 0
-        mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN,
-                                np.ones((2, 2), np.uint8), iterations=1)
-        blob_val, votes = _count_pips_in_mask(mask, b, h, w)
+        _, thr = cv2.threshold(gray, 0, 255, flags)
+        thr[:b, :] = thr[-b:, :] = thr[:, :b] = thr[:, -b:] = 0
+        thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
+                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
 
-        # Add black-hat result as 4th voter (works even when threshold fails)
-        bh_val = _count_pips_blackhat(gray, b)
+        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(thr)
+        count = 0
+        for i in range(1, n_labels):
+            a  = int(stats[i, cv2.CC_STAT_AREA])
+            cw = int(stats[i, cv2.CC_STAT_WIDTH])
+            ch = int(stats[i, cv2.CC_STAT_HEIGHT])
+            cx = int(stats[i, cv2.CC_STAT_LEFT]) + cw // 2
+            cy = int(stats[i, cv2.CC_STAT_TOP])  + ch // 2
+            if not (min_pip <= a <= max_pip):
+                continue
+            if ch == 0 or not (0.35 <= cw / ch <= 2.80):
+                continue
+            if (cw * ch) > 0 and a / (cw * ch) < 0.30:
+                continue
+            # Must not be on the border
+            if cx < b or cx > w - b or cy < b or cy > h - b:
+                continue
+            count += 1
 
-        all_votes = [v for v in (blob_val if votes > 0 else 0, bh_val) if 1 <= v <= 6]
-        if votes > 0 and 1 <= blob_val <= 6:
-            all_votes = [blob_val] * votes + ([bh_val] if 1 <= bh_val <= 6 else [])
-        elif 1 <= bh_val <= 6:
-            all_votes = [bh_val]
+        if 1 <= count <= 6:
+            votes.append(count)
 
-        if all_votes:
-            winner, freq = Counter(all_votes).most_common(1)[0]
-            if 1 <= winner <= 6:
-                return winner, _CONF.get(min(freq, 4), 0.40)
-
-    return 0, 0.0
+    if not votes:
+        return 0, 0.0
+    winner, freq = Counter(votes).most_common(1)[0]
+    conf = {2: 0.88, 1: 0.65}.get(freq, 0.65)
+    return winner, conf
 
 
 # ── Combined classifier ───────────────────────────────────────────────────────
@@ -561,67 +432,71 @@ def _count_pips(roi) -> Tuple[int, float]:
 def _detect_die_value(roi) -> Tuple[int, float, str]:
     """
     Returns (face_value, confidence 0-1, method_label).
-    Template matching wins when NCC >= 0.40 or it beats pip confidence.
+    ORB matching is primary when reference images are loaded.
+    Pip counting is the fallback and validator.
     """
-    tmpl_val, tmpl_conf = _classify_roi(roi)
+    orb_val,  orb_conf  = _match_orb(roi)
     pip_val,  pip_conf  = _count_pips(roi)
 
-    # Hard gate: if no pips detected at all, demand very high template confidence.
-    # This stops blank/flat white objects from being accepted on template match alone.
-    if pip_val == 0 and tmpl_conf < 0.65:
-        return 0, 0.0, "?"
+    # Both agree → highest possible confidence
+    if orb_val > 0 and pip_val > 0 and orb_val == pip_val:
+        combined = min(0.97, max(orb_conf, pip_conf) + 0.15)
+        return orb_val, combined, "orb+pips"
 
-    # Strong template match — trust it
-    if tmpl_conf >= 0.55 and tmpl_val > 0:
-        return tmpl_val, tmpl_conf, "template"
-    # Both methods agree — high confidence even if individual scores are modest
-    if tmpl_val > 0 and pip_val > 0 and tmpl_val == pip_val:
-        combined = min(0.95, (tmpl_conf + pip_conf) / 2 + 0.10)
-        return tmpl_val, combined, "template+pips"
-    # Both have signal but disagree — pick the more confident one (higher bar)
-    if tmpl_val > 0 and pip_val > 0:
-        if tmpl_conf >= 0.52 and tmpl_conf >= pip_conf:
-            return tmpl_val, tmpl_conf, "template"
-        if pip_conf >= 0.60:
-            return pip_val, pip_conf, "pips"
-    # Template only — need higher threshold since no pip confirmation
-    if tmpl_conf >= 0.55 and tmpl_val > 0:
-        return tmpl_val, tmpl_conf, "template"
-    # Pip only — need decent confidence
-    if pip_val > 0 and pip_conf >= 0.60:
+    # Strong ORB match (reference images loaded and matching well)
+    if orb_conf >= 0.55 and orb_val > 0:
+        return orb_val, orb_conf, "orb"
+
+    # Decent pip result, no ORB (no reference images loaded or poor match)
+    if pip_val > 0 and pip_conf >= 0.65:
         return pip_val, pip_conf, "pips"
-    # Nothing reliable enough
+
+    # Moderate ORB with some pip signal (different value is ok — ORB wins)
+    if orb_conf >= 0.40 and orb_val > 0 and pip_val > 0:
+        return orb_val, orb_conf, "orb"
+
+    # Weak pip only
+    if pip_val > 0 and pip_conf >= 0.50:
+        return pip_val, pip_conf, "pips"
+
     return 0, 0.0, "?"
 
 
-def _is_die_like(roi) -> bool:
-    """
-    Quick sanity checks before spending time on template matching.
-    Returns False for anything that clearly isn't a white/cream die face.
-    """
-    if roi is None or roi.size == 0:
-        return False
-    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
-    mean_brightness = float(np.mean(gray))
-    # Dice are white/cream — reject clearly dark objects
-    if mean_brightness < 85:
-        return False
-    # Must not be nearly all black
-    bright_pixels = float(np.sum(gray > 70)) / gray.size
-    if bright_pixels < 0.35:
-        return False
-    std = float(np.std(gray))
-    # Reject only very extreme cases:
-    # - Nearly uniform solid colour (std < 5): blank wall/paper with no pips
-    # - Wildly complex texture (std > 95): tablecloth, carpet, etc.
-    if std < 5 or std > 95:
-        return False
-    # Must have some dark pixels relative to the mean — the pips.
-    # A die face always has at least 1 pip (~1% dark area minimum).
-    dark_pixels = float(np.sum(gray < mean_brightness * 0.70)) / gray.size
-    if dark_pixels < 0.008:
-        return False
-    return True
+# ── Main analysis pipeline ────────────────────────────────────────────────────
+
+def _analyze_frame(frame) -> Tuple[List[Dict], List[Dict]]:
+    if not OPENCV_AVAILABLE or frame is None:
+        return [], []
+
+    fh, fw     = frame.shape[:2]
+    cand_rects = _find_die_candidates(frame)
+    detections: List[Dict] = []
+    candidates: List[Dict] = []
+
+    for (x, y, rw, rh) in cand_rects:
+        pad    = max(4, int(min(rw, rh) * 0.06))
+        x1, y1 = max(0, x - pad),    max(0, y - pad)
+        x2, y2 = min(fw, x + rw + pad), min(fh, y + rh + pad)
+        roi    = frame[y1:y2, x1:x2]
+
+        if not _is_die_like(roi):
+            continue
+
+        val, conf, method = _detect_die_value(roi)
+        candidates.append({'rect': (x, y, rw, rh), 'pips': val,
+                           'conf': conf, 'method': method, 'area': rw * rh})
+        if 1 <= val <= 6:
+            detections.append({'value': val, 'conf': conf,
+                               'method': method, 'rect': (x, y, rw, rh)})
+
+    detections.sort(key=lambda d: d['conf'], reverse=True)
+    top2 = detections[:2]
+    top2.sort(key=lambda d: d['rect'][0])
+    candidates.sort(key=lambda d: d['rect'][0])
+    return top2, candidates
+
+
+# ── Confidence bar widget ─────────────────────────────────────────────────────
 
 
 # ── Main analysis pipeline ────────────────────────────────────────────────────
