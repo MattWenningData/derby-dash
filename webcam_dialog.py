@@ -545,6 +545,11 @@ def _detect_die_value(roi) -> Tuple[int, float, str]:
     tmpl_val, tmpl_conf = _classify_roi(roi)
     pip_val,  pip_conf  = _count_pips(roi)
 
+    # Hard gate: if no pips detected at all, demand very high template confidence.
+    # This stops blank/flat white objects from being accepted on template match alone.
+    if pip_val == 0 and tmpl_conf < 0.65:
+        return 0, 0.0, "?"
+
     # Strong template match — trust it
     if tmpl_conf >= 0.55 and tmpl_val > 0:
         return tmpl_val, tmpl_conf, "template"
@@ -559,7 +564,7 @@ def _detect_die_value(roi) -> Tuple[int, float, str]:
         if pip_conf >= 0.60:
             return pip_val, pip_conf, "pips"
     # Template only — need higher threshold since no pip confirmation
-    if tmpl_conf >= 0.52 and tmpl_val > 0:
+    if tmpl_conf >= 0.55 and tmpl_val > 0:
         return tmpl_val, tmpl_conf, "template"
     # Pip only — need decent confidence
     if pip_val > 0 and pip_conf >= 0.60:
@@ -584,9 +589,16 @@ def _is_die_like(roi) -> bool:
     bright_pixels = float(np.sum(gray > 80)) / gray.size
     if bright_pixels < 0.40:
         return False
-    # The background of a die face is mostly uniform — measure std dev
-    # A face with extreme variance is probably not a die
-    if float(np.std(gray)) > 90:
+    std = float(np.std(gray))
+    # A blank white surface (paper, wall) has std ~2-8 — reject it.
+    # A heavily textured background has std > 85 — also reject.
+    # A real die face has std ~12-70 (bright background + dark pips).
+    if not (10 <= std <= 80):
+        return False
+    # Must have at least a few dark pixels (the pips) relative to the mean.
+    # A die face with 1 pip on white will have ~3-4% dark pixels.
+    dark_pixels = float(np.sum(gray < mean_brightness * 0.65)) / gray.size
+    if dark_pixels < 0.02:
         return False
     return True
 
