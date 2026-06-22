@@ -108,23 +108,46 @@ def _crop_die_face(img) -> Optional[object]:
     return img[max(0, y-pad):min(fh, y+bh+pad), max(0, x-pad):min(fw, x+bw+pad)]
 
 
+def _normalize_die_patch(gray) -> np.ndarray:
+    """
+    Lighting-invariant normalization: min-max stretch + bilateral smoothing.
+    This makes live frames look much closer to reference photos regardless of
+    ambient light level.
+    """
+    # Min-max stretch to full 0-255 range
+    mn, mx = float(gray.min()), float(gray.max())
+    if mx > mn:
+        gray = np.clip((gray.astype(np.float32) - mn) / (mx - mn) * 255, 0, 255).astype(np.uint8)
+    # Bilateral filter: smooths noise but keeps pip edges sharp
+    gray = cv2.bilateralFilter(gray, d=7, sigmaColor=40, sigmaSpace=40)
+    return gray
+
+
+def _edge_map(gray64) -> np.ndarray:
+    """Canny edge map of a 64×64 patch, normalized 0-255."""
+    edges = cv2.Canny(gray64, 20, 80)
+    return edges
+
+
 def _augment_template(gray64) -> List:
     """
-    Generate 36 augmented 64×64 grayscale variants per die face:
-    12 rotations (every 30°) × 3 brightness levels.
-    Finer rotation steps give much better coverage for tilted dice.
+    Generate 54 augmented 64×64 grayscale variants per die face:
+    9 rotations (every 40°) × 3 brightness × 2 (original + edge-normalized).
+    Edge-normalized variants allow lighting-invariant matching.
     """
     results = []
-    for angle in range(0, 360, 30):          # 12 rotations
+    for angle in range(0, 360, 40):          # 9 rotations
         if angle == 0:
             rot = gray64
         else:
             M   = cv2.getRotationMatrix2D((32, 32), float(angle), 1.0)
             rot = cv2.warpAffine(gray64, M, _TEMPLATE_SIZE)
-        for alpha in (0.75, 1.0, 1.30):      # dark / normal / bright
+        for alpha in (0.70, 1.0, 1.35):      # dark / normal / bright
             adj = np.clip(rot.astype(np.float32) * alpha, 0, 255).astype(np.uint8)
             results.append(adj)
-    return results   # 36 variants
+            # Also add an edge-map variant for lighting-invariant matching
+            results.append(_edge_map(adj))
+    return results   # 54 variants (9 × 3 × 2)
 
 
 def load_reference_images(folder: str) -> Tuple[int, str]:
@@ -170,17 +193,17 @@ def load_reference_images(folder: str) -> Tuple[int, str]:
             continue
 
         gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
-        gray  = clahe.apply(gray)
-        gray  = cv2.resize(gray, _TEMPLATE_SIZE)
+        gray = _normalize_die_patch(gray)
+        gray = cv2.resize(gray, _TEMPLATE_SIZE)
 
-        _TEMPLATES[value]    = _augment_template(gray)
+        _TEMPLATES[value] = _augment_template(gray)
 
-        # Pre-compute HOG feature vectors for lighting-invariant matching
+        # Pre-compute HOG only for intensity templates (every other, at indices 0,2,4,...)
         hog = _get_hog()
         if hog:
             _HOG_FEATURES[value] = [
-                hog.compute(t).flatten() for t in _TEMPLATES[value]
+                hog.compute(_TEMPLATES[value][i]).flatten()
+                for i in range(0, len(_TEMPLATES[value]), 2)
             ]
         loaded += 1
 
@@ -309,22 +332,25 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
 
 def _classify_roi(roi) -> Tuple[int, float]:
     """
-    Combined NCC + HOG template matching.
-    HOG (gradient-based) is lighting-invariant; NCC is fast.
-    Combined score = 0.5 * NCC + 0.5 * HOG_cosine_similarity.
-    Returns (best_val, best_score 0-1).
+    Multi-method template matching:
+      - NCC on normalized intensity patch (good when lighting matches)
+      - NCC on edge map (lighting invariant)
+      - HOG cosine similarity (structure/shape invariant)
+    All three are combined; best-matching face value wins.
     """
     if not _TEMPLATES or roi is None or roi.size == 0:
         return 0, 0.0
     if min(roi.shape[:2]) < 18:
         return 0, 0.0
 
-    gray  = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi.copy()
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(4, 4))
-    gray  = clahe.apply(gray)
-    gray  = cv2.resize(gray, _TEMPLATE_SIZE)
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi.copy()
+    gray = _normalize_die_patch(gray)
+    gray = cv2.resize(gray, _TEMPLATE_SIZE)
 
-    # Pre-compute HOG for the query ROI (once, reused for all templates)
+    # Edge map of live ROI — lighting invariant
+    roi_edges = _edge_map(gray)
+
+    # HOG of live ROI
     hog          = _get_hog()
     roi_hog      = None
     roi_hog_norm = 0.0
@@ -339,24 +365,40 @@ def _classify_roi(roi) -> Tuple[int, float]:
 
     for value, tmpls in _TEMPLATES.items():
         hog_feats = _HOG_FEATURES.get(value, [])
-        for i, tmpl in enumerate(tmpls):
-            ncc = float(cv2.matchTemplate(gray, tmpl, cv2.TM_CCOEFF_NORMED)[0, 0])
+        val_score = -1.0
 
-            if roi_hog is not None and roi_hog_norm > 1e-8 and i < len(hog_feats):
-                hf      = hog_feats[i]
+        # Templates alternate: [intensity_0, edge_0, intensity_1, edge_1, ...]
+        for i in range(0, len(tmpls), 2):
+            tmpl_intensity = tmpls[i]
+            tmpl_edge      = tmpls[i + 1] if i + 1 < len(tmpls) else None
+
+            ncc_intensity = float(cv2.matchTemplate(
+                gray, tmpl_intensity, cv2.TM_CCOEFF_NORMED)[0, 0])
+
+            ncc_edge = 0.0
+            if tmpl_edge is not None:
+                ncc_edge = float(cv2.matchTemplate(
+                    roi_edges, tmpl_edge, cv2.TM_CCOEFF_NORMED)[0, 0])
+
+            # HOG similarity (use the intensity template's HOG features)
+            hog_sim = 0.0
+            hog_idx = i // 2  # every other template pair shares a HOG index
+            if (roi_hog is not None and roi_hog_norm > 1e-8
+                    and hog_idx < len(hog_feats)):
+                hf      = hog_feats[hog_idx]
                 hf_norm = float(np.linalg.norm(hf))
                 if hf_norm > 1e-8:
                     hog_sim = float(np.dot(roi_hog, hf)) / (roi_hog_norm * hf_norm)
-                    # NCC carries 70% weight — it's more reliable when lighting matches.
-                    # HOG (30%) provides lighting-invariant tie-breaking.
-                    score   = 0.70 * ncc + 0.30 * hog_sim
-                else:
-                    score = ncc
-            else:
-                score = ncc
 
-            if score > best_score:
-                best_score, best_val = score, value
+            # Weighted combination: intensity 45% + edge 35% + HOG 20%
+            # Edge NCC is most lighting-invariant so gets strong weight
+            score = 0.45 * ncc_intensity + 0.35 * ncc_edge + 0.20 * hog_sim
+
+            if score > val_score:
+                val_score = score
+
+        if val_score > best_score:
+            best_score, best_val = val_score, value
 
     return best_val, max(0.0, best_score)
 
@@ -795,6 +837,28 @@ class WebcamDialog(QDialog):
         tmpl_btn_row.addStretch()
         tl.addLayout(tmpl_btn_row)
         tl.addWidget(self.tmpl_folder_label)
+
+        # Capture-from-camera reference workflow
+        cap_ref_row = QHBoxLayout()
+        cap_ref_row.addWidget(QLabel('Capture die face from camera:'))
+        self.cap_ref_spin = QSpinBox()
+        self.cap_ref_spin.setRange(1, 6)
+        self.cap_ref_spin.setValue(1)
+        self.cap_ref_spin.setPrefix('Face ')
+        self.cap_ref_spin.setFixedWidth(78)
+        self.cap_ref_btn = QPushButton('📷 Capture')
+        self.cap_ref_btn.setFixedWidth(90)
+        self.cap_ref_btn.setToolTip(
+            'Show this die face to the camera, then click to save it as a '
+            'reference image. Do this for all 6 faces under your actual lighting.')
+        self.cap_ref_btn.clicked.connect(self._capture_reference_face)
+        cap_ref_row.addWidget(self.cap_ref_spin)
+        cap_ref_row.addWidget(self.cap_ref_btn)
+        self.cap_ref_status = QLabel('')
+        self.cap_ref_status.setStyleSheet('color: #6EC86E; font-size: 11px;')
+        cap_ref_row.addWidget(self.cap_ref_status)
+        cap_ref_row.addStretch()
+        tl.addLayout(cap_ref_row)
         root.addWidget(tmpl_group)
 
         # Tips
@@ -915,6 +979,61 @@ class WebcamDialog(QDialog):
         if folder:
             n, msg = load_reference_images(folder)
             self._set_template_status(msg, n)
+
+    def _capture_reference_face(self):
+        """
+        Capture the current camera frame and save it as a reference image for the
+        selected die face value. The ROI of the best-detected die is used; if none
+        is found the full frame is saved. Reloads templates automatically.
+        """
+        if not OPENCV_AVAILABLE or self.current_frame is None:
+            self.cap_ref_status.setText('No frame available')
+            return
+        value = self.cap_ref_spin.value()
+        folder = Path(self.tmpl_folder_label.text())
+        if not folder.is_dir():
+            # Fall back to default folder, create if needed
+            folder = Path(_DEFAULT_TEMPLATE_DIR)
+            try:
+                folder.mkdir(parents=True, exist_ok=True)
+            except Exception:
+                self.cap_ref_status.setText('Cannot create folder')
+                return
+
+        # Use detected ROI if available, else full frame
+        frame = self.current_frame.copy()
+        saved_roi = frame
+        if self.current_detections:
+            # Use the highest-confidence detection's ROI
+            best = max(self.current_detections, key=lambda d: d['conf'])
+            x, y, w, h = best['rect']
+            fh, fw = frame.shape[:2]
+            pad = max(4, int(min(w, h) * 0.08))
+            saved_roi = frame[max(0, y-pad):min(fh, y+h+pad),
+                               max(0, x-pad):min(fw, x+w+pad)]
+        else:
+            # Try detecting from current frame directly
+            cands = _find_die_candidates(frame)
+            if cands:
+                best_c = max(cands, key=lambda r: r[2] * r[3])
+                x, y, w, h = best_c
+                fh, fw = frame.shape[:2]
+                pad = max(4, int(min(w, h) * 0.08))
+                saved_roi = frame[max(0, y-pad):min(fh, y+h+pad),
+                                   max(0, x-pad):min(fw, x+w+pad)]
+
+        out_path = folder / f"{value}.jpg"
+        cv2.imwrite(str(out_path), saved_roi)
+
+        # Reload templates from the folder
+        n, msg = load_reference_images(str(folder))
+        self._set_template_status(msg, n)
+
+        self.cap_ref_status.setText(f'✓ Face {value} saved!')
+        # Auto-advance to next face
+        if value < 6:
+            self.cap_ref_spin.setValue(value + 1)
+        QTimer.singleShot(2500, lambda: self.cap_ref_status.setText(''))
 
     # ── Camera lifecycle ───────────────────────────────────────────────────────
 
