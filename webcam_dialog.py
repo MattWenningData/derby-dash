@@ -223,68 +223,103 @@ def _nms(rects: List[Tuple[int,int,int,int]], iou_thresh: float = 0.30) \
 
 def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
     """
-    Locate die-face rectangles using the dice_recognizer algorithm:
-      Inverted Otsu threshold → RETR_TREE contours → filter by size and
-      near-square aspect ratio.  Die faces appear as dark "holes" in the
-      bright inverted image, so RETR_TREE reliably finds their outlines.
-      A second pass with non-inverted threshold catches darker dice.
+    Pip-first die localization: find dark circular pip blobs, cluster into dice.
+    This approach is specifically designed for white dice on cream/light backgrounds
+    where die edges have poor contrast but dark pips are highly visible.
+    Falls back to CLAHE+Otsu for other setups.
     """
     fh, fw = frame.shape[:2]
     fa     = fh * fw
     gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    # CLAHE boosts local contrast — helps when die and table are similar brightness
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    gray  = clahe.apply(gray)
-    blur  = cv2.GaussianBlur(gray, (5, 5), 0)
+    blur   = cv2.GaussianBlur(gray, (5, 5), 0)
     found: List[Tuple[int,int,int,int]] = []
 
-    def _check(cnt):
-        area = cv2.contourArea(cnt)
-        # Scale min area with frame size — die must be at least ~28×28 px
-        if not (fa * 0.0009 <= area <= fa * 0.28):
-            return None
-        rx, ry, rw, rh = cv2.boundingRect(cnt)
-        if rh == 0:
-            return None
-        # Dice are square — tight aspect ratio filter (dice_recognizer approach)
-        if not (0.75 <= rw / rh <= 1.35):
-            return None
-        # Die face fills most of its bounding box
-        if area / (rw * rh) < 0.50:
-            return None
-        return (rx, ry, rw, rh)
-
-    # ── Primary: THRESH_BINARY_INV + RETR_TREE (dice_recognizer algorithm) ──────
-    # Die face (bright) → black hole in white image; RETR_TREE finds the hole boundary.
-    for blur_img in (blur, cv2.GaussianBlur(gray, (3, 3), 0)):
-        _, thr = cv2.threshold(blur_img, 0, 255,
+    # ── Primary: pip-first clustering ────────────────────────────────────────
+    # Dark pips become bright blobs in inverted threshold — very high contrast
+    # regardless of whether the die face and background look similar.
+    _, pip_thr = cv2.threshold(blur, 0, 255,
                                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        for cnt in cv2.findContours(thr, cv2.RETR_TREE,
+
+    pip_min = max(8, fa * 0.000012)   # min pip blob area (scales with resolution)
+    pip_max = fa * 0.0020             # max pip blob area
+
+    pip_pts: List[Tuple[int, int, int]] = []  # (cx, cy, size)
+
+    for cnt in cv2.findContours(pip_thr, cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE)[0]:
+        area = cv2.contourArea(cnt)
+        if not (pip_min <= area <= pip_max):
+            continue
+        peri = cv2.arcLength(cnt, True)
+        if peri <= 0:
+            continue
+        circ = 4.0 * np.pi * area / (peri * peri)
+        if circ < 0.40:
+            continue
+        x, y, w, h = cv2.boundingRect(cnt)
+        pip_pts.append((x + w // 2, y + h // 2, max(w, h)))
+
+    if pip_pts:
+        sizes     = [p[2] for p in pip_pts]
+        med_size  = float(np.median(sizes))
+        clust_d   = med_size * 9.0  # pips on the same die fall within 9× pip size
+
+        # BFS cluster — groups pips that are spatially close
+        used = [False] * len(pip_pts)
+        for i in range(len(pip_pts)):
+            if used[i]:
+                continue
+            cluster: List[int] = []
+            stack = [i]
+            used[i] = True
+            while stack:
+                cur = stack.pop()
+                cluster.append(cur)
+                cx0, cy0, _ = pip_pts[cur]
+                for j in range(len(pip_pts)):
+                    if not used[j]:
+                        cx1, cy1, _ = pip_pts[j]
+                        if (cx0 - cx1)**2 + (cy0 - cy1)**2 < clust_d**2:
+                            used[j] = True
+                            stack.append(j)
+
+            n = len(cluster)
+            if 1 <= n <= 6:
+                xs  = [pip_pts[k][0] for k in cluster]
+                ys  = [pip_pts[k][1] for k in cluster]
+                pad = max(int(med_size * 2.2), 6)
+                x1  = max(0, min(xs) - pad)
+                y1  = max(0, min(ys) - pad)
+                x2  = min(fw, max(xs) + pad)
+                y2  = min(fh, max(ys) + pad)
+                dw, dh = x2 - x1, y2 - y1
+                if dw > 12 and dh > 12:
+                    found.append((x1, y1, dw, dh))
+
+    # ── Fallback: CLAHE + Otsu + RETR_TREE for darker/higher-contrast setups ─
+    clahe  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+    gray_c = clahe.apply(gray)
+    blur_c = cv2.GaussianBlur(gray_c, (5, 5), 0)
+
+    def _check_sq(cnt):
+        area = cv2.contourArea(cnt)
+        if not (fa * 0.0005 <= area <= fa * 0.25):
+            return None
+        x, y, w, h = cv2.boundingRect(cnt)
+        if h == 0 or not (0.70 <= w / h <= 1.45):
+            return None
+        if area / (w * h) < 0.45:
+            return None
+        return (x, y, w, h)
+
+    for flags in (cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
+                  cv2.THRESH_BINARY + cv2.THRESH_OTSU):
+        _, thr2 = cv2.threshold(blur_c, 0, 255, flags)
+        for cnt in cv2.findContours(thr2, cv2.RETR_TREE,
                                     cv2.CHAIN_APPROX_SIMPLE)[0]:
-            r = _check(cnt)
+            r = _check_sq(cnt)
             if r:
                 found.append(r)
-
-    # ── Secondary: THRESH_BINARY — for darker dice or bright backgrounds ─────────
-    _, thr2 = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    thr2 = cv2.morphologyEx(thr2, cv2.MORPH_CLOSE,
-                            np.ones((7, 7), np.uint8), iterations=2)
-    for cnt in cv2.findContours(thr2, cv2.RETR_TREE,
-                                cv2.CHAIN_APPROX_SIMPLE)[0]:
-        r = _check(cnt)
-        if r:
-            found.append(r)
-
-    # ── Tertiary: adaptive threshold — catches dice under uneven lighting ────────
-    adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                  cv2.THRESH_BINARY, 25, 6)
-    adapt = cv2.morphologyEx(adapt, cv2.MORPH_CLOSE,
-                             np.ones((5, 5), np.uint8), iterations=2)
-    for cnt in cv2.findContours(adapt, cv2.RETR_TREE,
-                                cv2.CHAIN_APPROX_SIMPLE)[0]:
-        r = _check(cnt)
-        if r:
-            found.append(r)
 
     return _nms(found)
 
@@ -292,20 +327,21 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
 # ── Die face sanity check ─────────────────────────────────────────────────────
 
 def _is_die_like(roi) -> bool:
-    """Return True only if the ROI plausibly contains a white/cream die face."""
+    """Return True only if the ROI plausibly contains a die face.
+    Intentionally loose — pip-first localization already ensures we're
+    looking at a pip cluster region; we just reject obviously wrong patches.
+    """
     if roi is None or roi.size == 0:
         return False
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi
     mean_b = float(np.mean(gray))
-    if mean_b < 80:                                          # too dark
-        return False
-    if float(np.sum(gray > 65)) / gray.size < 0.30:         # mostly black
+    if mean_b < 50:                                          # too dark overall
         return False
     std = float(np.std(gray))
-    if std < 4 or std > 100:                                 # blank or chaotic
+    if std < 3 or std > 110:                                 # blank or chaotic
         return False
     # Must have some dark pixels (the pips)
-    if float(np.sum(gray < mean_b * 0.72)) / gray.size < 0.006:
+    if float(np.sum(gray < mean_b * 0.75)) / gray.size < 0.003:
         return False
     return True
 
