@@ -223,92 +223,68 @@ def _nms(rects: List[Tuple[int,int,int,int]], iou_thresh: float = 0.30) \
 
 def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
     """
-    Locate die-face rectangles using three complementary approaches:
-      1. HSV white/bright region isolation
-      2. Canny edges at two sigma levels
-      3. Otsu threshold (both polarities)
-    Geometry filter is deliberately permissive — downstream classifiers
-    reject non-dice based on appearance, not shape alone.
+    Locate die-face rectangles using the dice_recognizer algorithm:
+      Inverted Otsu threshold → RETR_TREE contours → filter by size and
+      near-square aspect ratio.  Die faces appear as dark "holes" in the
+      bright inverted image, so RETR_TREE reliably finds their outlines.
+      A second pass with non-inverted threshold catches darker dice.
     """
     fh, fw = frame.shape[:2]
     fa     = fh * fw
     gray   = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    blur   = cv2.GaussianBlur(gray, (5, 5), 0)
+    # CLAHE boosts local contrast — helps when die and table are similar brightness
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    gray  = clahe.apply(gray)
+    blur  = cv2.GaussianBlur(gray, (5, 5), 0)
     found: List[Tuple[int,int,int,int]] = []
 
     def _check(cnt):
         area = cv2.contourArea(cnt)
-        if not (fa * 0.0004 <= area <= fa * 0.40):
-            return None
-        peri = cv2.arcLength(cnt, True)
-        if peri == 0:
+        # Scale min area with frame size — die must be at least ~28×28 px
+        if not (fa * 0.0009 <= area <= fa * 0.28):
             return None
         rx, ry, rw, rh = cv2.boundingRect(cnt)
         if rh == 0:
             return None
-        if not (0.40 <= rw/rh <= 2.20):
+        # Dice are square — tight aspect ratio filter (dice_recognizer approach)
+        if not (0.75 <= rw / rh <= 1.35):
             return None
-        if area / (rw * rh) < 0.25:
+        # Die face fills most of its bounding box
+        if area / (rw * rh) < 0.50:
             return None
         return (rx, ry, rw, rh)
 
-    # ── Method 1: HSV white/cream isolation ──────────────────────────────────
-    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
-    for lo_v, hi_s in ((130, 90), (110, 110), (150, 65)):
-        lo    = np.array([0,   0,   lo_v], dtype=np.uint8)
-        hi    = np.array([179, hi_s, 255], dtype=np.uint8)
-        wmask = cv2.inRange(hsv, lo, hi)
-        wmask = cv2.morphologyEx(wmask, cv2.MORPH_CLOSE,
-                                 np.ones((9,9), np.uint8), iterations=2)
-        wmask = cv2.morphologyEx(wmask, cv2.MORPH_OPEN,
-                                 np.ones((5,5), np.uint8), iterations=1)
-        for cnt in cv2.findContours(wmask, cv2.RETR_EXTERNAL,
+    # ── Primary: THRESH_BINARY_INV + RETR_TREE (dice_recognizer algorithm) ──────
+    # Die face (bright) → black hole in white image; RETR_TREE finds the hole boundary.
+    for blur_img in (blur, cv2.GaussianBlur(gray, (3, 3), 0)):
+        _, thr = cv2.threshold(blur_img, 0, 255,
+                               cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+        for cnt in cv2.findContours(thr, cv2.RETR_TREE,
                                     cv2.CHAIN_APPROX_SIMPLE)[0]:
             r = _check(cnt)
             if r:
                 found.append(r)
 
-    # ── Method 2: Canny edges ─────────────────────────────────────────────────
-    median = float(np.median(blur))
-    for sigma in (0.30, 0.55):
-        lo_c = max(10, int(median * (1 - sigma)))
-        hi_c = min(255, int(median * (1 + sigma)))
-        edges = cv2.Canny(blur, lo_c, hi_c)
-        edges = cv2.dilate(edges, np.ones((3,3), np.uint8), iterations=1)
-        for cnt in cv2.findContours(edges, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
-            r = _check(cnt)
-            if r:
-                found.append(r)
+    # ── Secondary: THRESH_BINARY — for darker dice or bright backgrounds ─────────
+    _, thr2 = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr2 = cv2.morphologyEx(thr2, cv2.MORPH_CLOSE,
+                            np.ones((7, 7), np.uint8), iterations=2)
+    for cnt in cv2.findContours(thr2, cv2.RETR_TREE,
+                                cv2.CHAIN_APPROX_SIMPLE)[0]:
+        r = _check(cnt)
+        if r:
+            found.append(r)
 
-    # ── Method 3: Otsu threshold ──────────────────────────────────────────────
-    for flags in (cv2.THRESH_BINARY + cv2.THRESH_OTSU,
-                  cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU):
-        _, binary = cv2.threshold(blur, 0, 255, flags)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE,
-                                  np.ones((7,7), np.uint8), iterations=2)
-        binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN,
-                                  np.ones((3,3), np.uint8), iterations=1)
-        for cnt in cv2.findContours(binary, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
-            r = _check(cnt)
-            if r:
-                found.append(r)
-
-    # ── Method 4: Adaptive threshold — catches dice when local contrast is low ─
-    for block, c in ((21, 5), (35, 8)):
-        adapt = cv2.adaptiveThreshold(blur, 255,
-                                      cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
-                                      cv2.THRESH_BINARY, block, c)
-        adapt = cv2.morphologyEx(adapt, cv2.MORPH_OPEN,
-                                 np.ones((3,3), np.uint8), iterations=1)
-        adapt = cv2.morphologyEx(adapt, cv2.MORPH_CLOSE,
-                                 np.ones((5,5), np.uint8), iterations=2)
-        for cnt in cv2.findContours(adapt, cv2.RETR_EXTERNAL,
-                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
-            r = _check(cnt)
-            if r:
-                found.append(r)
+    # ── Tertiary: adaptive threshold — catches dice under uneven lighting ────────
+    adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY, 25, 6)
+    adapt = cv2.morphologyEx(adapt, cv2.MORPH_CLOSE,
+                             np.ones((5, 5), np.uint8), iterations=2)
+    for cnt in cv2.findContours(adapt, cv2.RETR_TREE,
+                                cv2.CHAIN_APPROX_SIMPLE)[0]:
+        r = _check(cnt)
+        if r:
+            found.append(r)
 
     return _nms(found)
 
@@ -386,10 +362,11 @@ def _match_orb(roi) -> Tuple[int, float]:
 
 def _count_pips(roi) -> Tuple[int, float]:
     """
-    Count pips using three methods with majority vote:
-      1. Connected components on Otsu-INV threshold (dark pips → white blobs)
-      2. Connected components on Otsu threshold (second polarity, backup)
-      3. Black-hat morphology (finds dark pips regardless of Otsu polarity — best for "3")
+    Count pips using the dice_recognizer circularity approach:
+      - Otsu threshold (both polarities) + RETR_EXTERNAL
+      - Keep contours with circularity > 0.55 and appropriate area
+      - Black-hat morphology as 3rd vote (especially good for diagonal '3')
+    Three independent votes; confidence based on agreement.
     """
     if not OPENCV_AVAILABLE or roi is None or roi.size == 0:
         return 0, 0.0
@@ -397,59 +374,49 @@ def _count_pips(roi) -> Tuple[int, float]:
         return 0, 0.0
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi.copy()
-    gray = cv2.bilateralFilter(gray, 7, 50, 50)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
     h, w = gray.shape
-    b    = max(3, int(min(h, w) * 0.08))
     roi_area = h * w
-    min_pip  = max(6,  roi_area * 0.003)   # lowered from 0.006 — catches smaller/closer pips
-    max_pip  = max(min_pip + 1, roi_area * 0.12)
+    min_pip  = max(6,  roi_area * 0.003)
+    max_pip  = roi_area * 0.12
 
-    def _cc_count(thr_img):
-        img = thr_img.copy()
-        img[:b, :] = img[-b:, :] = img[:, :b] = img[:, -b:] = 0
-        img = cv2.morphologyEx(img, cv2.MORPH_OPEN,
-                               cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3)))
-        n_labels, _, stats, _ = cv2.connectedComponentsWithStats(img)
+    def _circ_count(thr_img) -> int:
+        cnts, _ = cv2.findContours(thr_img, cv2.RETR_EXTERNAL,
+                                   cv2.CHAIN_APPROX_SIMPLE)
         count = 0
-        for i in range(1, n_labels):
-            a  = int(stats[i, cv2.CC_STAT_AREA])
-            cw = int(stats[i, cv2.CC_STAT_WIDTH])
-            ch = int(stats[i, cv2.CC_STAT_HEIGHT])
-            cx = int(stats[i, cv2.CC_STAT_LEFT]) + cw // 2
-            cy = int(stats[i, cv2.CC_STAT_TOP])  + ch // 2
-            if not (min_pip <= a <= max_pip):
+        for cnt in cnts:
+            area = cv2.contourArea(cnt)
+            if not (min_pip <= area <= max_pip):
                 continue
-            if ch == 0 or not (0.30 <= cw / ch <= 3.20):
+            peri = cv2.arcLength(cnt, True)
+            if peri <= 0:
                 continue
-            if (cw * ch) > 0 and a / (cw * ch) < 0.25:
-                continue
-            if cx < b or cx > w - b or cy < b or cy > h - b:
-                continue
-            count += 1
+            circularity = 4.0 * np.pi * area / (peri * peri)
+            if circularity > 0.55:
+                count += 1
         return count
 
     votes = []
 
-    # Method 1 & 2: Otsu both polarities
+    # Votes 1 & 2: Otsu both polarities (dice_recognizer approach)
     for inv in (True, False):
         flags = (cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU if inv
                  else cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, thr = cv2.threshold(gray, 0, 255, flags)
-        c = _cc_count(thr)
+        _, thr = cv2.threshold(blur, 0, 255, flags)
+        c = _circ_count(thr)
         if 1 <= c <= 6:
             votes.append(c)
 
-    # Method 3: black-hat morphology — finds dark blobs on bright background
-    # especially reliable for "3" (diagonal pips) and any die under flat lighting
-    k_size = max(5, min(h, w) // 4)
-    if k_size % 2 == 0:
-        k_size += 1
-    kernel   = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_size, k_size))
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    _, bh_thr = cv2.threshold(blackhat, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    bh_count = _cc_count(bh_thr)
-    if 1 <= bh_count <= 6:
-        votes.append(bh_count)
+    # Vote 3: black-hat morphology — finds dark pips regardless of Otsu polarity
+    k = max(5, min(h, w) // 4)
+    if k % 2 == 0:
+        k += 1
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
+    bh = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
+    _, bh_thr = cv2.threshold(bh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    c = _circ_count(bh_thr)
+    if 1 <= c <= 6:
+        votes.append(c)
 
     if not votes:
         return 0, 0.0
