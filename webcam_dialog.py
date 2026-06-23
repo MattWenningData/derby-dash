@@ -871,19 +871,26 @@ class WebcamDialog(QDialog):
         """)
 
     def _populate_cameras(self):
-        """Scan indices 0-4 for cameras that actually open, then pre-select default."""
+        """Scan indices 0-3 for cameras that actually open, then pre-select default."""
         self.camera_combo.blockSignals(True)
         self.camera_combo.clear()
 
         available = []
         if OPENCV_AVAILABLE:
-            for i in range(5):
-                cap = cv2.VideoCapture(i)
-                if cap and cap.isOpened():
-                    available.append(i)
-                    cap.release()
+            import platform
+            # CAP_DSHOW on Windows fails fast for non-existent indices (vs MSMF which hangs)
+            backend = cv2.CAP_DSHOW if platform.system() == 'Windows' else 0
+            for i in range(4):
+                try:
+                    cap = cv2.VideoCapture(i, backend) if backend else cv2.VideoCapture(i)
+                    if cap and cap.isOpened():
+                        available.append(i)
+                    if cap:
+                        cap.release()
+                except Exception:
+                    pass
         if not available:
-            available = list(range(4))   # fallback when OpenCV unavailable
+            available = list(range(2))   # fallback
 
         for i in available:
             self.camera_combo.addItem(f'Camera {i}', i)
@@ -985,7 +992,9 @@ class WebcamDialog(QDialog):
         self.release_camera()
         if not OPENCV_AVAILABLE:
             return
-        cap = cv2.VideoCapture(int(index))
+        import platform
+        backend = cv2.CAP_DSHOW if platform.system() == 'Windows' else 0
+        cap = cv2.VideoCapture(int(index), backend) if backend else cv2.VideoCapture(int(index))
         if cap:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
@@ -1032,6 +1041,8 @@ class WebcamDialog(QDialog):
             import traceback
             self.status_label.setText(f'Error: {exc}')
             traceback.print_exc()
+            # Always show the raw feed even if detection crashes
+            self._show_frame(frame)
 
     def _draw_cooldown_overlay(self, frame):
         """Show camera feed with a centred countdown banner during cooldown."""
