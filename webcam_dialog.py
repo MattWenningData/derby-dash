@@ -689,15 +689,49 @@ class WebcamDialog(QDialog):
         cam_row.addWidget(self.debug_chk)
         root.addLayout(cam_row)
 
+        # ── Feed size controls (zoom in/out) ─────────────────────────────────
+        from PyQt6.QtWidgets import QSplitter, QWidget, QSizePolicy as QSP
+        zoom_row = QHBoxLayout()
+        zoom_row.addWidget(QLabel('Camera view:'))
+        self._zoom_shrink = QPushButton('−')
+        self._zoom_shrink.setFixedWidth(28)
+        self._zoom_shrink.setToolTip('Shrink camera view')
+        self._zoom_shrink.clicked.connect(self._shrink_feed)
+        self._zoom_grow = QPushButton('+')
+        self._zoom_grow.setFixedWidth(28)
+        self._zoom_grow.setToolTip('Expand camera view')
+        self._zoom_grow.clicked.connect(self._grow_feed)
+        zoom_row.addWidget(self._zoom_shrink)
+        zoom_row.addWidget(self._zoom_grow)
+        zoom_row.addWidget(QLabel('(drag divider to resize freely)'))
+        zoom_row.addStretch()
+        root.addLayout(zoom_row)
+
+        # ── QSplitter: camera feed (top) / controls (bottom) ─────────────────
+        self._splitter = QSplitter(Qt.Orientation.Vertical)
+        self._splitter.setHandleWidth(6)
+        self._splitter.setChildrenCollapsible(False)
+
+        # Top pane — camera feed
+        feed_pane = QWidget()
+        feed_pane.setSizePolicy(QSP.Policy.Expanding, QSP.Policy.Expanding)
+        feed_layout = QVBoxLayout(feed_pane)
+        feed_layout.setContentsMargins(0, 0, 0, 0)
+
         # Live feed — small safety minimum; takes all spare vertical space
         self.feed_label = QLabel('Starting camera...')
         self.feed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.feed_label.setMinimumSize(320, 240)   # bare minimum — dialog handles sizing
-        from PyQt6.QtWidgets import QSizePolicy
-        self.feed_label.setSizePolicy(
-            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.feed_label.setMinimumSize(320, 160)
+        self.feed_label.setSizePolicy(QSP.Policy.Expanding, QSP.Policy.Expanding)
         self.feed_label.setObjectName('feedLabel')
-        root.addWidget(self.feed_label, stretch=1)
+        feed_layout.addWidget(self.feed_label)
+        self._splitter.addWidget(feed_pane)
+
+        # Bottom pane — all controls
+        ctrl_pane = QWidget()
+        ctrl_layout = QVBoxLayout(ctrl_pane)
+        ctrl_layout.setContentsMargins(0, 4, 0, 0)
+        ctrl_layout.setSpacing(7)
 
         # Confidence bars (one per die)
         conf_row = QHBoxLayout()
@@ -706,7 +740,7 @@ class WebcamDialog(QDialog):
         self.conf_bar2 = ConfidenceBar('2')
         conf_row.addWidget(self.conf_bar1, 1)
         conf_row.addWidget(self.conf_bar2, 1)
-        root.addLayout(conf_row)
+        ctrl_layout.addLayout(conf_row)
 
         # Auto-submit row
         auto_row = QHBoxLayout()
@@ -724,7 +758,7 @@ class WebcamDialog(QDialog):
         auto_row.addWidget(self.auto_slider)
         auto_row.addWidget(self.auto_thresh_lbl)
         auto_row.addStretch()
-        root.addLayout(auto_row)
+        ctrl_layout.addLayout(auto_row)
 
         # Stability + Cooldown row
         sc_row = QHBoxLayout()
@@ -748,14 +782,14 @@ class WebcamDialog(QDialog):
         self.cooldown_spin.setFixedWidth(68)
         sc_row.addWidget(self.cooldown_spin)
         sc_row.addStretch()
-        root.addLayout(sc_row)
+        ctrl_layout.addLayout(sc_row)
 
         # Status / method labels
         self.status_label = QLabel('Status: Searching for dice...')
         self.method_label = QLabel('')
         self.method_label.setStyleSheet('color: #90C890; font-size: 11px;')
-        root.addWidget(self.status_label)
-        root.addWidget(self.method_label)
+        ctrl_layout.addWidget(self.status_label)
+        ctrl_layout.addWidget(self.method_label)
 
         # Action buttons
         btn_row = QHBoxLayout()
@@ -771,7 +805,7 @@ class WebcamDialog(QDialog):
         btn_row.addWidget(self.capture_button)
         btn_row.addWidget(self.use_result_button)
         btn_row.addWidget(self.save_frame_button)
-        root.addLayout(btn_row)
+        ctrl_layout.addLayout(btn_row)
 
         # Template images group
         tmpl_group = QGroupBox('Reference Template Images')
@@ -822,7 +856,7 @@ class WebcamDialog(QDialog):
         cap_ref_row.addWidget(self.cap_ref_status)
         cap_ref_row.addStretch()
         tl.addLayout(cap_ref_row)
-        root.addWidget(tmpl_group)
+        ctrl_layout.addWidget(tmpl_group)
 
         # Tips
         tips = QLabel(
@@ -831,7 +865,7 @@ class WebcamDialog(QDialog):
         )
         tips.setWordWrap(True)
         tips.setStyleSheet('color: #90A890; font-size: 11px;')
-        root.addWidget(tips)
+        ctrl_layout.addWidget(tips)
 
         # Manual override
         manual = QGridLayout()
@@ -847,11 +881,17 @@ class WebcamDialog(QDialog):
         use_manual = QPushButton('Use Manual')
         use_manual.clicked.connect(self.use_manual_result)
         manual.addWidget(use_manual, 0, 5)
-        root.addLayout(manual)
+        ctrl_layout.addLayout(manual)
 
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(self.close)
-        root.addWidget(close_btn)
+        ctrl_layout.addWidget(close_btn)
+        ctrl_layout.addStretch()
+
+        self._splitter.addWidget(ctrl_pane)
+
+        # Set initial split: ~60% feed, ~40% controls
+        root.addWidget(self._splitter, stretch=1)
 
         self.camera_combo.currentIndexChanged.connect(self.switch_camera)
 
@@ -888,6 +928,26 @@ class WebcamDialog(QDialog):
                                           margin: -4px 0; border-radius: 7px; }
             QSlider::sub-page:horizontal { background: #4A9B3A; border-radius: 3px; }
         """)
+        # Set initial splitter proportions once sizes are known
+        QTimer.singleShot(0, self._init_splitter_sizes)
+
+    def _init_splitter_sizes(self):
+        total = self._splitter.height()
+        if total > 0:
+            feed_h = int(total * 0.60)
+            self._splitter.setSizes([feed_h, total - feed_h])
+
+    def _shrink_feed(self):
+        sizes = self._splitter.sizes()
+        if len(sizes) == 2 and sizes[0] > 120:
+            step = max(40, sizes[0] // 6)
+            self._splitter.setSizes([sizes[0] - step, sizes[1] + step])
+
+    def _grow_feed(self):
+        sizes = self._splitter.sizes()
+        if len(sizes) == 2 and sizes[1] > 80:
+            step = max(40, sizes[0] // 6)
+            self._splitter.setSizes([sizes[0] + step, sizes[1] - step])
 
     def _populate_cameras(self):
         """Scan indices 0-3 for cameras that actually open, then pre-select default."""
