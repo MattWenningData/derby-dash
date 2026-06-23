@@ -223,10 +223,17 @@ def _nms(rects: List[Tuple[int,int,int,int]], iou_thresh: float = 0.30) \
 
 def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
     """
-    Pip-first die localization: find dark circular pip blobs, cluster into dice.
-    This approach is specifically designed for white dice on cream/light backgrounds
-    where die edges have poor contrast but dark pips are highly visible.
-    Falls back to CLAHE+Otsu for other setups.
+    Multi-strategy die localization — works on both dark and light backgrounds:
+
+    Method 1 (dark background): Find bright white rectangular blobs directly.
+      White dice on black surface have extreme contrast — simple threshold finds
+      them instantly. This is the most reliable method when using a dark backdrop.
+
+    Method 2 (any background): Pip-first clustering.
+      Find dark circular pip blobs, group nearby ones into dice. Works even when
+      die face and background are similar brightness (white on cream).
+
+    Method 3 (fallback): CLAHE + Otsu for higher-contrast non-white setups.
     """
     fh, fw = frame.shape[:2]
     fa     = fh * fw
@@ -234,16 +241,50 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
     blur   = cv2.GaussianBlur(gray, (5, 5), 0)
     found: List[Tuple[int,int,int,int]] = []
 
-    # ── Primary: pip-first clustering ────────────────────────────────────────
+    def _check_sq(cnt):
+        area = cv2.contourArea(cnt)
+        if not (fa * 0.0005 <= area <= fa * 0.30):
+            return None
+        x, y, w, h = cv2.boundingRect(cnt)
+        if h == 0 or not (0.65 <= w / h <= 1.55):
+            return None
+        if area / (w * h) < 0.42:
+            return None
+        return (x, y, w, h)
+
+    # ── Method 1: bright-region on dark background ────────────────────────────
+    # Simple fixed + Otsu thresholds find white dice on black instantly.
+    # Also catches rotated dice since we filter by fill ratio not exact shape.
+    for thresh in (180, 200, 220):
+        _, thr = cv2.threshold(blur, thresh, 255, cv2.THRESH_BINARY)
+        thr = cv2.morphologyEx(thr, cv2.MORPH_CLOSE,
+                               np.ones((7, 7), np.uint8), iterations=2)
+        thr = cv2.morphologyEx(thr, cv2.MORPH_OPEN,
+                               np.ones((3, 3), np.uint8), iterations=1)
+        for cnt in cv2.findContours(thr, cv2.RETR_EXTERNAL,
+                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
+            r = _check_sq(cnt)
+            if r:
+                found.append(r)
+
+    _, thr_otsu = cv2.threshold(blur, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    thr_otsu = cv2.morphologyEx(thr_otsu, cv2.MORPH_CLOSE,
+                                np.ones((7, 7), np.uint8), iterations=2)
+    for cnt in cv2.findContours(thr_otsu, cv2.RETR_EXTERNAL,
+                                cv2.CHAIN_APPROX_SIMPLE)[0]:
+        r = _check_sq(cnt)
+        if r:
+            found.append(r)
+
+    # ── Method 2: pip-first clustering (works on light/cream backgrounds) ─────
     # Dark pips become bright blobs in inverted threshold — very high contrast
     # regardless of whether the die face and background look similar.
     _, pip_thr = cv2.threshold(blur, 0, 255,
                                cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
 
-    pip_min = max(8, fa * 0.000012)   # min pip blob area (scales with resolution)
-    pip_max = fa * 0.0020             # max pip blob area
-
-    pip_pts: List[Tuple[int, int, int]] = []  # (cx, cy, size)
+    pip_min = max(8, fa * 0.000012)
+    pip_max = fa * 0.0020
+    pip_pts: List[Tuple[int, int, int]] = []
 
     for cnt in cv2.findContours(pip_thr, cv2.RETR_EXTERNAL,
                                 cv2.CHAIN_APPROX_SIMPLE)[0]:
@@ -253,18 +294,14 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
         peri = cv2.arcLength(cnt, True)
         if peri <= 0:
             continue
-        circ = 4.0 * np.pi * area / (peri * peri)
-        if circ < 0.40:
+        if 4.0 * np.pi * area / (peri * peri) < 0.40:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
         pip_pts.append((x + w // 2, y + h // 2, max(w, h)))
 
     if pip_pts:
-        sizes     = [p[2] for p in pip_pts]
-        med_size  = float(np.median(sizes))
-        clust_d   = med_size * 9.0  # pips on the same die fall within 9× pip size
-
-        # BFS cluster — groups pips that are spatially close
+        med_size = float(np.median([p[2] for p in pip_pts]))
+        clust_d  = med_size * 9.0
         used = [False] * len(pip_pts)
         for i in range(len(pip_pts)):
             if used[i]:
@@ -282,44 +319,26 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
                         if (cx0 - cx1)**2 + (cy0 - cy1)**2 < clust_d**2:
                             used[j] = True
                             stack.append(j)
-
             n = len(cluster)
             if 1 <= n <= 6:
                 xs  = [pip_pts[k][0] for k in cluster]
                 ys  = [pip_pts[k][1] for k in cluster]
                 pad = max(int(med_size * 2.2), 6)
-                x1  = max(0, min(xs) - pad)
-                y1  = max(0, min(ys) - pad)
-                x2  = min(fw, max(xs) + pad)
-                y2  = min(fh, max(ys) + pad)
+                x1, y1 = max(0, min(xs) - pad), max(0, min(ys) - pad)
+                x2, y2 = min(fw, max(xs) + pad), min(fh, max(ys) + pad)
                 dw, dh = x2 - x1, y2 - y1
                 if dw > 12 and dh > 12:
                     found.append((x1, y1, dw, dh))
 
-    # ── Fallback: CLAHE + Otsu + RETR_TREE for darker/higher-contrast setups ─
+    # ── Method 3: CLAHE fallback ──────────────────────────────────────────────
     clahe  = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
-    gray_c = clahe.apply(gray)
-    blur_c = cv2.GaussianBlur(gray_c, (5, 5), 0)
-
-    def _check_sq(cnt):
-        area = cv2.contourArea(cnt)
-        if not (fa * 0.0005 <= area <= fa * 0.25):
-            return None
-        x, y, w, h = cv2.boundingRect(cnt)
-        if h == 0 or not (0.70 <= w / h <= 1.45):
-            return None
-        if area / (w * h) < 0.45:
-            return None
-        return (x, y, w, h)
-
-    for flags in (cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU,
-                  cv2.THRESH_BINARY + cv2.THRESH_OTSU):
-        _, thr2 = cv2.threshold(blur_c, 0, 255, flags)
-        for cnt in cv2.findContours(thr2, cv2.RETR_TREE,
-                                    cv2.CHAIN_APPROX_SIMPLE)[0]:
-            r = _check_sq(cnt)
-            if r:
-                found.append(r)
+    blur_c = cv2.GaussianBlur(clahe.apply(gray), (5, 5), 0)
+    _, thr2 = cv2.threshold(blur_c, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    for cnt in cv2.findContours(thr2, cv2.RETR_TREE,
+                                cv2.CHAIN_APPROX_SIMPLE)[0]:
+        r = _check_sq(cnt)
+        if r:
+            found.append(r)
 
     return _nms(found)
 
