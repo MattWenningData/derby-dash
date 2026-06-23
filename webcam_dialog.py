@@ -877,12 +877,9 @@ class WebcamDialog(QDialog):
 
         available = []
         if OPENCV_AVAILABLE:
-            import platform
-            # CAP_DSHOW on Windows fails fast for non-existent indices (vs MSMF which hangs)
-            backend = cv2.CAP_DSHOW if platform.system() == 'Windows' else 0
             for i in range(4):
                 try:
-                    cap = cv2.VideoCapture(i, backend) if backend else cv2.VideoCapture(i)
+                    cap = cv2.VideoCapture(i)
                     if cap and cap.isOpened():
                         available.append(i)
                     if cap:
@@ -992,9 +989,7 @@ class WebcamDialog(QDialog):
         self.release_camera()
         if not OPENCV_AVAILABLE:
             return
-        import platform
-        backend = cv2.CAP_DSHOW if platform.system() == 'Windows' else 0
-        cap = cv2.VideoCapture(int(index), backend) if backend else cv2.VideoCapture(int(index))
+        cap = cv2.VideoCapture(int(index))
         if cap:
             cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1280)
             cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
