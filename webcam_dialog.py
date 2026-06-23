@@ -1000,6 +1000,16 @@ class WebcamDialog(QDialog):
             self.status_label.setText('Status: No camera found')
             self.capture_button.setEnabled(False)
             return
+        # Verify the camera actually produces frames (some indices report as
+        # "opened" on Windows but return no real frames)
+        ok, _ = cap.read()
+        if not ok:
+            cap.release()
+            self.camera_available = False
+            self.feed_label.setText(f'Camera {index} opened but returned no frames.\nTry a different camera.')
+            self.status_label.setText(f'Status: Camera {index} not usable')
+            self.capture_button.setEnabled(False)
+            return
         self.capture          = cap
         self.camera_available = True
         self.is_frozen        = False
