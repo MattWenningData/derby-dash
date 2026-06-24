@@ -146,7 +146,38 @@ QPushButton#btn_reset:hover {
     border-color: #A84030;
 }
 
-/* ── Inputs ──────────────────────────────────────────────────────────── */
+/* ── Auto Roll button ────────────────────────────────────────────────── */
+QPushButton#btn_auto {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+        stop:0 #1A5028, stop:1 #0C2C14);
+    border: 1px solid #2A7A3A;
+    border-bottom: 2px solid #061408;
+    color: #90E8A0;
+    border-radius: 7px;
+    font-weight: bold;
+    font-family: "Georgia", serif;
+    font-size: 13px;
+    padding: 6px 12px;
+}
+QPushButton#btn_auto:hover {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+        stop:0 #246832, stop:1 #10381A);
+    color: #B8FFB8;
+    border-color: #40A850;
+}
+QPushButton#btn_auto:checked, QPushButton#btn_auto:pressed {
+    background: qlineargradient(x1:0,y1:0,x2:0,y2:1,
+        stop:0 #6A1818, stop:1 #3A1010);
+    color: #FFB8A0;
+    border-color: #A84030;
+}
+QPushButton#btn_auto:disabled {
+    background: #141A14;
+    color: #405040;
+    border-color: #222E22;
+}
+
+
 QSpinBox, QComboBox, QLineEdit {
     background: #0C0804;
     color: #D8C880;

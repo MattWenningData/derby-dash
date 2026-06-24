@@ -10,13 +10,9 @@ from typing import List, Dict, Any
 # ── File path ──────────────────────────────────────────────────────────────────
 
 def get_history_path() -> Path:
-    """Return path to race_history.csv next to the executable (or script)."""
-    if getattr(sys, 'frozen', False):
-        # PyInstaller bundle — use the folder containing the .exe
-        base = Path(sys.executable).parent
-    else:
-        base = Path(__file__).parent
-    return base / 'race_history.csv'
+    """Return path to race_history.csv in the user's writable data folder."""
+    from paths import race_history_path
+    return race_history_path()
 
 
 # ── CSV schema ─────────────────────────────────────────────────────────────────

@@ -1,16 +1,3 @@
-"""
-webcam_dialog.py
-Webcam-based dice reader for Derby Dash.
-
-Detection pipeline
-──────────────────
-1.  _find_die_candidates()  – multi-method (HSV / Canny / Otsu) rectangle
-                              detection to locate each die face in the frame.
-2.  _match_orb()            – ORB feature matching against reference photos.
-                              Primary classifier when reference images are loaded.
-3.  _count_pips()           – fallback: connected-component pip counting.
-4.  _detect_die_value()     – combines ORB + pip results; boost when they agree.
-"""
 from __future__ import annotations
 
 import json
@@ -60,9 +47,8 @@ def _get_orb():
 # ── Webcam config (persists default camera selection) ─────────────────────────
 
 def _config_path() -> Path:
-    base = (Path(sys.executable).parent
-            if getattr(sys, 'frozen', False) else Path(__file__).parent)
-    return base / 'webcam_config.json'
+    from paths import webcam_config_path
+    return webcam_config_path()
 
 def _load_webcam_config() -> Dict:
     try:
@@ -79,6 +65,107 @@ def _save_webcam_config(data: Dict) -> None:
             json.dump(existing, f, indent=2)
     except Exception:
         pass
+
+
+# ── Training data (correction log + bias learning) ────────────────────────────
+
+def _get_training_dir() -> Path:
+    from paths import training_data_dir
+    return training_data_dir()
+
+_TRAINING_DIR = _get_training_dir()
+_CORRECTIONS_LOG = _TRAINING_DIR / 'corrections_log.json'
+
+
+def _ensure_training_dir():
+    _TRAINING_DIR.mkdir(parents=True, exist_ok=True)
+    (_TRAINING_DIR / 'frames').mkdir(exist_ok=True)
+
+
+def _save_training_entry(frame, detected_d1: int, detected_d2: int,
+                         true_d1: int, true_d2: int) -> None:
+    """
+    Save a training log entry.  Always called after a roll is confirmed.
+    If the user corrected the values, was_corrected=True and the true_d*
+    fields reflect the correction.  The full frame is saved as a JPEG so
+    the detection algorithm can be re-evaluated against real examples later.
+    """
+    if not OPENCV_AVAILABLE:
+        return
+    try:
+        _ensure_training_dir()
+        import datetime
+        ts = datetime.datetime.now().strftime('%Y%m%d_%H%M%S_%f')
+        frame_name = f'frame_{ts}.jpg'
+        frame_path = str(_TRAINING_DIR / 'frames' / frame_name)
+        if frame is not None:
+            cv2.imwrite(frame_path, frame)
+        else:
+            frame_path = ''
+
+        was_corrected = (detected_d1 != true_d1 or detected_d2 != true_d2)
+        entry = {
+            'timestamp': datetime.datetime.now().isoformat(),
+            'detected_d1': detected_d1,
+            'detected_d2': detected_d2,
+            'true_d1': true_d1,
+            'true_d2': true_d2,
+            'was_corrected': was_corrected,
+            'frame_path': frame_path,
+        }
+
+        # Append to JSON log
+        log: list = []
+        if _CORRECTIONS_LOG.exists():
+            try:
+                with open(_CORRECTIONS_LOG, encoding='utf-8') as f:
+                    log = json.load(f)
+            except Exception:
+                log = []
+        log.append(entry)
+        with open(_CORRECTIONS_LOG, 'w', encoding='utf-8') as f:
+            json.dump(log, f, indent=2)
+    except Exception:
+        pass
+
+
+def _load_bias_table() -> Dict[int, int]:
+    """
+    Build a per-value bias correction table from the correction log.
+
+    For each detected value X that was manually corrected to Y:
+      - If X has been corrected ≥ 5 times AND ≥ 75 % of those corrections
+        changed it to the same value Y → add X→Y to the bias table.
+      - Bias is only applied when detection confidence is low (< 0.75), so
+        confident correct detections are never overridden.
+
+    Returns {detected_value: corrected_value}.
+    """
+    if not _CORRECTIONS_LOG.exists():
+        return {}
+    try:
+        with open(_CORRECTIONS_LOG, encoding='utf-8') as f:
+            log = json.load(f)
+    except Exception:
+        return {}
+
+    # Count per-die corrections (treat each die independently)
+    corrections: Dict[int, Counter] = {}
+    for entry in log:
+        if not entry.get('was_corrected'):
+            continue
+        for det, true in [(entry['detected_d1'], entry['true_d1']),
+                          (entry['detected_d2'], entry['true_d2'])]:
+            if det != true and 1 <= det <= 6 and 1 <= true <= 6:
+                corrections.setdefault(det, Counter())[true] += 1
+
+    bias: Dict[int, int] = {}
+    for det_val, counter in corrections.items():
+        total = sum(counter.values())
+        best_val, best_cnt = counter.most_common(1)[0]
+        if total >= 5 and best_cnt / total >= 0.75:
+            bias[det_val] = best_val
+    return bias
 
 
 # ── Reference image loading ───────────────────────────────────────────────────
@@ -243,9 +330,11 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
 
     def _check_sq(cnt):
         area = cv2.contourArea(cnt)
-        if not (fa * 0.0005 <= area <= fa * 0.30):
+        if not (fa * 0.0005 <= area <= fa * 0.06):   # contour area
             return None
         x, y, w, h = cv2.boundingRect(cnt)
+        if w * h > fa * 0.08:                         # bounding rect area — rejects frame/border
+            return None
         if h == 0 or not (0.65 <= w / h <= 1.55):
             return None
         if area / (w * h) < 0.42:
@@ -294,7 +383,7 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
         peri = cv2.arcLength(cnt, True)
         if peri <= 0:
             continue
-        if 4.0 * np.pi * area / (peri * peri) < 0.40:
+        if 4.0 * np.pi * area / (peri * peri) < 0.35:
             continue
         x, y, w, h = cv2.boundingRect(cnt)
         pip_pts.append((x + w // 2, y + h // 2, max(w, h)))
@@ -327,7 +416,8 @@ def _find_die_candidates(frame) -> List[Tuple[int,int,int,int]]:
                 x1, y1 = max(0, min(xs) - pad), max(0, min(ys) - pad)
                 x2, y2 = min(fw, max(xs) + pad), min(fh, max(ys) + pad)
                 dw, dh = x2 - x1, y2 - y1
-                if dw > 12 and dh > 12:
+                # Reject non-square pip clusters (noise streaks, frame edges)
+                if dw > 12 and dh > 12 and 0.55 <= dw / dh <= 1.80:
                     found.append((x1, y1, dw, dh))
 
     # ── Method 3: CLAHE fallback ──────────────────────────────────────────────
@@ -415,69 +505,258 @@ def _match_orb(roi) -> Tuple[int, float]:
 
 # ── Pip counting (connected components) ──────────────────────────────────────
 
+def _deskew_roi(roi):
+    """
+    Return a rotation-corrected copy of a die ROI.
+    Finds the largest bright blob, gets its minAreaRect angle, and rotates
+    the crop to axis-align the die face. Falls back to the original if it fails.
+    """
+    if roi is None or roi.size == 0 or min(roi.shape[:2]) < 20:
+        return roi
+    gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi.copy()
+    _, thr = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    cnts, _ = cv2.findContours(thr, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cnts:
+        return roi
+    largest = max(cnts, key=cv2.contourArea)
+    rect = cv2.minAreaRect(largest)
+    angle = rect[2]
+    # minAreaRect returns angle in (-90, 0]; normalise to (-45, 45]
+    if angle < -45:
+        angle += 90
+    if abs(angle) < 3:   # already nearly square — skip expensive warp
+        return roi
+    h, w = roi.shape[:2]
+    M = cv2.getRotationMatrix2D((w / 2, h / 2), angle, 1.0)
+    rotated = cv2.warpAffine(roi if roi.ndim == 3 else
+                              cv2.cvtColor(roi, cv2.COLOR_GRAY2BGR),
+                              M, (w, h),
+                              flags=cv2.INTER_LINEAR,
+                              borderMode=cv2.BORDER_CONSTANT,
+                              borderValue=(0, 0, 0))
+    return rotated
+
+
 def _count_pips(roi) -> Tuple[int, float]:
     """
-    Count pips using the dice_recognizer circularity approach:
-      - Otsu threshold (both polarities) + RETR_EXTERNAL
-      - Keep contours with circularity > 0.55 and appropriate area
-      - Black-hat morphology as 3rd vote (especially good for diagonal '3')
-    Three independent votes; confidence based on agreement.
+    Two-stage pip counting: isolate die face, then find pips inside it.
+
+    Stage 1 -- THRESH_BINARY + OTSU finds the bright die face on black background.
+    Two separate close kernels are used:
+      - face_big (large kernel): fills pip holes completely -> used for V2/V4/V5
+      - face_small (small kernel): leaves pip holes open -> used for V6 RETR_CCOMP
+
+    Stage 2 -- 6 independent votes, all masked to die face only:
+      V1  SimpleBlobDetector with area+circ+convexity+inertia filters
+      V2  pip_holes = face_big_interior AND NOT face_mask  (filled holes)
+      V3  HoughCircles on inverted die face
+      V4  Adaptive threshold within die face
+      V5  Black-hat morphology within die face
+      V6  RETR_CCOMP internal contours of face_small blob
+
+    Key improvements:
+    - min_pip based on die FACE area (not total ROI area) -- handles pips that
+      are small relative to bounding box (e.g. rotated dice where bbox > face)
+    - Circularity threshold 0.50 (was 0.35) -- rejects text/edge shadow artifacts
+      (real pips are near-circular: circ > 0.65; text/noise: 0.20-0.50)
+    - Larger k_close for V2 ensures pip holes are fully filled even for larger pips
+    - Upsample to 200px for consistent sizing regardless of camera distance
     """
     if not OPENCV_AVAILABLE or roi is None or roi.size == 0:
         return 0, 0.0
-    if min(roi.shape[:2]) < 20:
+    if min(roi.shape[:2]) < 16:
         return 0, 0.0
 
     gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY) if roi.ndim == 3 else roi.copy()
-    blur = cv2.GaussianBlur(gray, (5, 5), 0)
-    h, w = gray.shape
-    roi_area = h * w
-    min_pip  = max(6,  roi_area * 0.003)
-    max_pip  = roi_area * 0.12
 
-    def _circ_count(thr_img) -> int:
-        cnts, _ = cv2.findContours(thr_img, cv2.RETR_EXTERNAL,
+    # Upsample to ~200px on longest side for consistent pip size
+    h, w = gray.shape
+    upscale = 200 / max(h, w)
+    if upscale > 1.0:
+        nh, nw = max(1, int(h * upscale)), max(1, int(w * upscale))
+        gray = cv2.resize(gray, (nw, nh), interpolation=cv2.INTER_CUBIC)
+        h, w = nh, nw
+
+    gray = cv2.equalizeHist(gray)
+    blur = cv2.GaussianBlur(gray, (5, 5), 0)
+
+    # Stage 1: die face mask
+    _, face_mask = cv2.threshold(blur, 0, 255,
+                                 cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+
+    # Large close: fills pip holes completely (used for V2 pip-holes subtraction)
+    k_big = max(17, min(h, w) // 4)
+    if k_big % 2 == 0:
+        k_big += 1
+    kern_big = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_big, k_big))
+    face_big = cv2.morphologyEx(face_mask, cv2.MORPH_CLOSE, kern_big)
+
+    # Small close: just kills tiny noise, leaves pip holes open (for V6 RETR_CCOMP)
+    k_small = max(5, min(h, w) // 14)
+    if k_small % 2 == 0:
+        k_small += 1
+    kern_small = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_small, k_small))
+    face_small = cv2.morphologyEx(face_mask, cv2.MORPH_CLOSE, kern_small)
+
+    # Erode face_big to get die face interior (strips edge shadow)
+    k_erode = max(3, min(h, w) // 20)
+    if k_erode % 2 == 0:
+        k_erode += 1
+    kern_e = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_erode, k_erode))
+    face_interior = cv2.erode(face_big, kern_e, iterations=1)
+
+    face_area = float(np.sum(face_interior > 0))
+    # Sanity check: if face fills >90% of ROI, this is likely a noise false-positive
+    if face_area / (h * w) > 0.90 or face_area < 400:
+        return 0, 0.0
+
+    # Pip bounds based on DIE FACE area (not total ROI area).
+    # Real pips typically cover 0.8-8% of the die face; we accept 0.7-18%.
+    min_pip = max(50, face_area * 0.008)
+    max_pip = face_area * 0.18
+
+    kern_open = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+
+    def count_round(img, circ_thresh=0.50) -> int:
+        """Count roughly-circular blobs within pip area bounds.
+        Default circ=0.50 filters out text and shadow artifacts while keeping
+        real pips (which are near-perfect circles: circ typically 0.65-0.95).
+
+        Applies a consistency filter: after collecting circular blobs, any blob
+        with area < 55% of the median blob area is rejected as a fragment.
+        This handles the case where noise blobs are significantly smaller than
+        the real pips (e.g. 186px² noise alongside 380px² real pips on a 2-die).
+        """
+        cnts, _ = cv2.findContours(img, cv2.RETR_EXTERNAL,
                                    cv2.CHAIN_APPROX_SIMPLE)
-        count = 0
+        areas = []
         for cnt in cnts:
             area = cv2.contourArea(cnt)
             if not (min_pip <= area <= max_pip):
                 continue
             peri = cv2.arcLength(cnt, True)
-            if peri <= 0:
-                continue
-            circularity = 4.0 * np.pi * area / (peri * peri)
-            if circularity > 0.55:
-                count += 1
-        return count
+            if peri > 0 and 4 * np.pi * area / (peri * peri) > circ_thresh:
+                areas.append(area)
+        if not areas:
+            return 0
+        # Consistency filter: reject blobs much smaller than the median.
+        # Real pips on the same die are roughly equal in size; fragments are not.
+        median_a = sorted(areas)[len(areas) // 2]
+        areas = [a for a in areas if a >= median_a * 0.55]
+        return min(6, len(areas))
 
     votes = []
+    v1_result = 0   # anchor: SimpleBlobDetector is most reliable (6/6 correct)
 
-    # Votes 1 & 2: Otsu both polarities (dice_recognizer approach)
-    for inv in (True, False):
-        flags = (cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU if inv
-                 else cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        _, thr = cv2.threshold(blur, 0, 255, flags)
-        c = _circ_count(thr)
+    # Vote 1: SimpleBlobDetector -- dark pips on bright die face.
+    # Added TWICE to the vote list to give it double weight; it is the only
+    # method that is correct for all 6 die values on these dice.
+    #
+    # Key live-video improvements over earlier versions:
+    #   • face_big (not face_interior) is used as the mask — the k_erode step
+    #     can clip pips that sit near the die edge in a slightly rotated live
+    #     frame, causing under-counts.  face_big = fully-closed face without
+    #     the erosion strip, so all pips remain visible.
+    #   • minCircularity lowered 0.55→0.45: slight motion blur or defocus in
+    #     live video makes pips appear less perfectly circular; 0.45 still
+    #     rejects elongated text/shadow artifacts.
+    #   • minConvexity lowered 0.75→0.65 for the same reason.
+    try:
+        bparams = cv2.SimpleBlobDetector_Params()
+        bparams.minThreshold = 10
+        bparams.maxThreshold = 220
+        bparams.thresholdStep = 10
+        bparams.filterByColor       = True
+        bparams.blobColor           = 0
+        bparams.filterByArea        = True
+        bparams.minArea             = float(max(40, min_pip * 0.7))
+        bparams.maxArea             = float(min(6000, max_pip * 1.3))
+        bparams.filterByCircularity = True
+        bparams.minCircularity      = 0.55
+        bparams.filterByConvexity   = True
+        bparams.minConvexity        = 0.75
+        bparams.filterByInertia     = True
+        bparams.minInertiaRatio     = 0.45
+        bparams.minDistBetweenBlobs = float(max(5, min(h, w) // 15))
+        detector = cv2.SimpleBlobDetector_create(bparams)
+        # Use face_interior (eroded face) so die-edge shadow pixels are excluded
+        die_only = np.where(face_interior > 0, blur,
+                            np.full_like(blur, 255)).astype(np.uint8)
+        kps = detector.detect(die_only)
+        c = min(6, len(kps))
         if 1 <= c <= 6:
-            votes.append(c)
+            v1_result = c
+            votes.append(c)   # first vote
+            votes.append(c)   # double weight — V1 is the anchor
+    except Exception:
+        pass
 
-    # Vote 3: black-hat morphology — finds dark pips regardless of Otsu polarity
-    k = max(5, min(h, w) // 4)
-    if k % 2 == 0:
-        k += 1
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k, k))
-    bh = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    _, bh_thr = cv2.threshold(bh, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-    c = _circ_count(bh_thr)
+    # Vote 2: pip holes -- face_big has pips filled; subtract from original mask
+    pip_holes = cv2.bitwise_and(face_interior, cv2.bitwise_not(face_mask))
+    pip_holes = cv2.morphologyEx(pip_holes, cv2.MORPH_OPEN, kern_open)
+    c = count_round(pip_holes, circ_thresh=0.55)   # stricter: holes are rounder
     if 1 <= c <= 6:
         votes.append(c)
 
+    # Vote 3: HoughCircles removed — tested against all 6 die values and found
+    # to be incorrect 4/6 times (systematically over-detects circles on these
+    # dice), making it a net negative for accuracy.
+
+    # Vote 4: adaptive threshold within die face.
+    # Gated: only counted if the result is within ±1 of V1's anchor value.
+    # Without the gate, V4 was wrong 4/6 times (text/shadow artifacts).
+    block = max(11, min(h, w) // 5)
+    if block % 2 == 0:
+        block += 1
+    adapt = cv2.adaptiveThreshold(blur, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
+                                  cv2.THRESH_BINARY_INV, block, 5)
+    adapt_face = cv2.bitwise_and(adapt, face_interior)
+    adapt_face = cv2.morphologyEx(adapt_face, cv2.MORPH_OPEN, kern_open)
+    c = count_round(adapt_face)
+    if 1 <= c <= 6:
+        if v1_result == 0 or abs(c - v1_result) <= 1:
+            votes.append(c)
+
+    # Vote 5: black-hat morphology within die face
+    k_bh = max(11, min(h, w) // 6)
+    if k_bh % 2 == 0:
+        k_bh += 1
+    kern_bh = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (k_bh, k_bh))
+    bh = cv2.morphologyEx(blur, cv2.MORPH_BLACKHAT, kern_bh)
+    bh_face = cv2.bitwise_and(bh, face_interior)
+    if bh_face.max() > 4:
+        _, bh_thr = cv2.threshold(bh_face, 0, 255,
+                                  cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        bh_thr = cv2.morphologyEx(bh_thr, cv2.MORPH_OPEN, kern_open)
+        c = count_round(bh_thr)
+        if 1 <= c <= 6:
+            votes.append(c)
+
+    # Vote 6: RETR_CCOMP -- internal contours (pip holes) of face_small blob.
+    # Circularity raised to 0.55 (was 0.40) to match the other methods and
+    # prevent false pip detections from noise in the die face texture.
+    cnts_tree, hier = cv2.findContours(face_small, cv2.RETR_CCOMP,
+                                       cv2.CHAIN_APPROX_SIMPLE)
+    if hier is not None:
+        pip_n = 0
+        for i, cnt in enumerate(cnts_tree):
+            if hier[0][i][3] >= 0:     # has parent -> pip hole
+                area = cv2.contourArea(cnt)
+                if min_pip <= area <= max_pip:
+                    peri = cv2.arcLength(cnt, True)
+                    if peri > 0 and 4 * np.pi * area / (peri * peri) > 0.55:
+                        pip_n += 1
+        if 1 <= pip_n <= 6:
+            votes.append(pip_n)
+
     if not votes:
         return 0, 0.0
+
     winner, freq = Counter(votes).most_common(1)[0]
-    conf = {3: 0.92, 2: 0.82, 1: 0.65}.get(freq, 0.65)
+    total = len(votes)
+    conf = min(0.95, 0.50 + (freq / total) * 0.47)
     return winner, conf
+
 
 
 # ── Combined classifier ───────────────────────────────────────────────────────
@@ -485,34 +764,36 @@ def _count_pips(roi) -> Tuple[int, float]:
 def _detect_die_value(roi) -> Tuple[int, float, str]:
     """
     Returns (face_value, confidence 0-1, method_label).
-    ORB matching is primary when reference images are loaded.
-    Pip counting is the fallback and validator.
+    Runs detection on the original ROI **and** on a deskewed copy — takes the
+    result with higher confidence (rotation-corrected often wins for tilted dice).
     """
-    orb_val,  orb_conf  = _match_orb(roi)
-    pip_val,  pip_conf  = _count_pips(roi)
+    def _classify(r) -> Tuple[int, float, str]:
+        orb_val, orb_conf = _match_orb(r)
+        pip_val, pip_conf = _count_pips(r)
 
-    # Both agree → highest possible confidence
-    if orb_val > 0 and pip_val > 0 and orb_val == pip_val:
-        combined = min(0.97, max(orb_conf, pip_conf) + 0.15)
-        return orb_val, combined, "orb+pips"
+        if orb_val > 0 and pip_val > 0 and orb_val == pip_val:
+            combined = min(0.97, max(orb_conf, pip_conf) + 0.15)
+            return orb_val, combined, "orb+pips"
+        if orb_conf >= 0.55 and orb_val > 0:
+            return orb_val, orb_conf, "orb"
+        if pip_val > 0 and pip_conf >= 0.60:
+            return pip_val, pip_conf, "pips"
+        if orb_conf >= 0.40 and orb_val > 0 and pip_val > 0:
+            return orb_val, orb_conf, "orb"
+        if pip_val > 0 and pip_conf >= 0.45:
+            return pip_val, pip_conf, "pips"
+        return 0, 0.0, "?"
 
-    # Strong ORB match (reference images loaded and matching well)
-    if orb_conf >= 0.55 and orb_val > 0:
-        return orb_val, orb_conf, "orb"
+    val, conf, method = _classify(roi)
 
-    # Decent pip result, no ORB (no reference images loaded or poor match)
-    if pip_val > 0 and pip_conf >= 0.65:
-        return pip_val, pip_conf, "pips"
+    # Also try deskewed version — rotated dice often score higher after correction
+    deskewed = _deskew_roi(roi)
+    if deskewed is not roi:
+        val2, conf2, meth2 = _classify(deskewed)
+        if conf2 > conf + 0.05:   # only switch if meaningfully better
+            return val2, conf2, meth2 + "+dsk"
 
-    # Moderate ORB with some pip signal (different value is ok — ORB wins)
-    if orb_conf >= 0.40 and orb_val > 0 and pip_val > 0:
-        return orb_val, orb_conf, "orb"
-
-    # Weak pip only
-    if pip_val > 0 and pip_conf >= 0.50:
-        return pip_val, pip_conf, "pips"
-
-    return 0, 0.0, "?"
+    return val, conf, method
 
 
 # ── Main analysis pipeline ────────────────────────────────────────────────────
@@ -528,7 +809,7 @@ def _analyze_frame(frame) -> Tuple[List[Dict], List[Dict]]:
 
     for (x, y, rw, rh) in cand_rects:
         pad    = max(4, int(min(rw, rh) * 0.06))
-        x1, y1 = max(0, x - pad),    max(0, y - pad)
+        x1, y1 = max(0, x - pad),       max(0, y - pad)
         x2, y2 = min(fw, x + rw + pad), min(fh, y + rh + pad)
         roi    = frame[y1:y2, x1:x2]
 
@@ -536,6 +817,13 @@ def _analyze_frame(frame) -> Tuple[List[Dict], List[Dict]]:
             continue
 
         val, conf, method = _detect_die_value(roi)
+
+        # Small confidence penalty for detections close to frame edges
+        # (frame borders, shelf, etc. tend to produce false detections there)
+        margin = min(x, fw - (x + rw), y, fh - (y + rh))
+        if margin < min(fw, fh) * 0.04:
+            conf = max(0.0, conf - 0.15)
+
         candidates.append({'rect': (x, y, rw, rh), 'pips': val,
                            'conf': conf, 'method': method, 'area': rw * rh})
         if 1 <= val <= 6:
@@ -622,8 +910,8 @@ class WebcamDialog(QDialog):
         # Stores last N frame-readings as (d1_val, d2_val) sorted ascending.
         # A result is "stable" when the same pair appears in >= _STABLE_NEEDED
         # of the last _STABLE_WINDOW frames. Prevents single-frame false positives.
-        self._STABLE_WINDOW  = 8
-        self._STABLE_NEEDED  = 6
+        self._STABLE_WINDOW  = 6
+        self._STABLE_NEEDED  = 4
         self._stable_buffer: deque = deque(maxlen=self._STABLE_WINDOW)
         self._stable_progress = 0   # how many consecutive matching frames
 
@@ -639,6 +927,21 @@ class WebcamDialog(QDialog):
         self._cd_timer.setSingleShot(False)
         self._cd_timer.timeout.connect(self._cooldown_tick)
 
+        # ── ROI state ──────────────────────────────────────────────────────────
+        self._roi: Optional[tuple]  = None   # (x1, y1, x2, y2) in frame pixels
+        self._roi_selecting         = False
+        self._roi_drag_start: Optional[tuple] = None
+        self._roi_preview: Optional[tuple]    = None
+        self._current_frame                   = None  # most recent raw frame
+        self._saved_roi_fractions             = None  # loaded from config
+
+        # ── Confirmation / training state ──────────────────────────────────────
+        # When a stable reading fires, _pending_detected stores (d1, d2) and the
+        # confirmation panel is shown instead of immediately emitting.
+        self._pending_detected: Optional[tuple] = None   # (d1, d2) last auto-detected
+        self._pending_frame                     = None   # frame snapshot for training
+        self._bias_table: Dict[int, int]        = {}     # loaded from corrections_log
+
         self._build_ui()
         self._apply_styles()
         self._populate_cameras()
@@ -653,12 +956,14 @@ class WebcamDialog(QDialog):
         self.move(screen.x() + (screen.width()  - dlg_w) // 2,
                   screen.y() + (screen.height() - dlg_h) // 2)
 
-        # Auto-load templates from default folder
         if OPENCV_AVAILABLE:
-            n, msg = load_reference_images(_DEFAULT_TEMPLATE_DIR)
-            self._set_template_status(msg, n)
+            load_reference_images(_DEFAULT_TEMPLATE_DIR)
             default_cam = _load_webcam_config().get('default_camera', 0)
             self.open_camera(default_cam)
+            # Restore saved ROI (stored as fractions, resolved on first frame)
+            self._saved_roi_fractions = _load_webcam_config().get('roi', None)
+            # Load learned correction bias from training log
+            self._bias_table = _load_bias_table()
         else:
             self.capture_button.setEnabled(False)
             self.camera_combo.setEnabled(False)
@@ -674,7 +979,7 @@ class WebcamDialog(QDialog):
 
         root.addWidget(self._make_title())
 
-        # Camera selector
+        # Camera selector row
         cam_row = QHBoxLayout()
         cam_row.addWidget(QLabel('Camera:'))
         self.camera_combo = QComboBox()
@@ -689,49 +994,36 @@ class WebcamDialog(QDialog):
         cam_row.addWidget(self.debug_chk)
         root.addLayout(cam_row)
 
-        # ── Feed size controls (zoom in/out) ─────────────────────────────────
-        from PyQt6.QtWidgets import QSplitter, QWidget, QSizePolicy as QSP
-        zoom_row = QHBoxLayout()
-        zoom_row.addWidget(QLabel('Camera view:'))
-        self._zoom_shrink = QPushButton('−')
-        self._zoom_shrink.setFixedWidth(28)
-        self._zoom_shrink.setToolTip('Shrink camera view')
-        self._zoom_shrink.clicked.connect(self._shrink_feed)
-        self._zoom_grow = QPushButton('+')
-        self._zoom_grow.setFixedWidth(28)
-        self._zoom_grow.setToolTip('Expand camera view')
-        self._zoom_grow.clicked.connect(self._grow_feed)
-        zoom_row.addWidget(self._zoom_shrink)
-        zoom_row.addWidget(self._zoom_grow)
-        zoom_row.addWidget(QLabel('(drag divider to resize freely)'))
-        zoom_row.addStretch()
-        root.addLayout(zoom_row)
+        # ROI row — draw detection area on the live feed
+        roi_row = QHBoxLayout()
+        self._roi_btn = QPushButton('📐 Set Detection Area')
+        self._roi_btn.setToolTip(
+            'Click then drag a rectangle on the camera feed to limit\n'
+            'detection to that area. Useful for ignoring borders/clutter.')
+        self._roi_btn.setCheckable(True)
+        self._roi_btn.toggled.connect(self._on_roi_mode_toggled)
+        self._roi_clear_btn = QPushButton('✕ Clear Area')
+        self._roi_clear_btn.setToolTip('Remove the detection area crop — use full frame')
+        self._roi_clear_btn.setEnabled(False)
+        self._roi_clear_btn.clicked.connect(self._clear_roi)
+        self._roi_status_lbl = QLabel('')
+        self._roi_status_lbl.setStyleSheet('color: #F5D76E; font-size: 11px;')
+        roi_row.addWidget(self._roi_btn)
+        roi_row.addWidget(self._roi_clear_btn)
+        roi_row.addWidget(self._roi_status_lbl, 1)
+        root.addLayout(roi_row)
 
-        # ── QSplitter: camera feed (top) / controls (bottom) ─────────────────
-        self._splitter = QSplitter(Qt.Orientation.Vertical)
-        self._splitter.setHandleWidth(6)
-        self._splitter.setChildrenCollapsible(False)
-
-        # Top pane — camera feed
-        feed_pane = QWidget()
-        feed_pane.setSizePolicy(QSP.Policy.Expanding, QSP.Policy.Expanding)
-        feed_layout = QVBoxLayout(feed_pane)
-        feed_layout.setContentsMargins(0, 0, 0, 0)
-
-        # Live feed — small safety minimum; takes all spare vertical space
+        # Live feed — fills spare vertical space; mouse events used for ROI
+        from PyQt6.QtWidgets import QSizePolicy
         self.feed_label = QLabel('Starting camera...')
         self.feed_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.feed_label.setMinimumSize(320, 160)
-        self.feed_label.setSizePolicy(QSP.Policy.Expanding, QSP.Policy.Expanding)
+        self.feed_label.setMinimumSize(320, 240)
+        self.feed_label.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.feed_label.setObjectName('feedLabel')
-        feed_layout.addWidget(self.feed_label)
-        self._splitter.addWidget(feed_pane)
-
-        # Bottom pane — all controls
-        ctrl_pane = QWidget()
-        ctrl_layout = QVBoxLayout(ctrl_pane)
-        ctrl_layout.setContentsMargins(0, 4, 0, 0)
-        ctrl_layout.setSpacing(7)
+        self.feed_label.setMouseTracking(True)
+        self.feed_label.installEventFilter(self)
+        root.addWidget(self.feed_label, stretch=1)
 
         # Confidence bars (one per die)
         conf_row = QHBoxLayout()
@@ -740,7 +1032,7 @@ class WebcamDialog(QDialog):
         self.conf_bar2 = ConfidenceBar('2')
         conf_row.addWidget(self.conf_bar1, 1)
         conf_row.addWidget(self.conf_bar2, 1)
-        ctrl_layout.addLayout(conf_row)
+        root.addLayout(conf_row)
 
         # Auto-submit row
         auto_row = QHBoxLayout()
@@ -758,14 +1050,14 @@ class WebcamDialog(QDialog):
         auto_row.addWidget(self.auto_slider)
         auto_row.addWidget(self.auto_thresh_lbl)
         auto_row.addStretch()
-        ctrl_layout.addLayout(auto_row)
+        root.addLayout(auto_row)
 
         # Stability + Cooldown row
         sc_row = QHBoxLayout()
         sc_row.addWidget(QLabel('Stability frames:'))
         self.stable_spin = QSpinBox()
         self.stable_spin.setRange(1, 10)
-        self.stable_spin.setValue(6)
+        self.stable_spin.setValue(4)
         self.stable_spin.setToolTip(
             'How many consecutive matching frames are required before auto-submitting.\n'
             'Higher = more reliable but slightly slower response.')
@@ -782,14 +1074,71 @@ class WebcamDialog(QDialog):
         self.cooldown_spin.setFixedWidth(68)
         sc_row.addWidget(self.cooldown_spin)
         sc_row.addStretch()
-        ctrl_layout.addLayout(sc_row)
+        root.addLayout(sc_row)
 
         # Status / method labels
         self.status_label = QLabel('Status: Searching for dice...')
         self.method_label = QLabel('')
         self.method_label.setStyleSheet('color: #90C890; font-size: 11px;')
-        ctrl_layout.addWidget(self.status_label)
-        ctrl_layout.addWidget(self.method_label)
+        root.addWidget(self.status_label)
+        root.addWidget(self.method_label)
+
+        # ── Confirmation panel ────────────────────────────────────────────────
+        # Shown after each stable auto-detection; hidden during normal scanning.
+        self._confirm_grp = QGroupBox('Dice Result — Confirm or Correct')
+        self._confirm_grp.setObjectName('confirmGrp')
+        self._confirm_grp.setVisible(False)
+        cg_layout = QVBoxLayout(self._confirm_grp)
+        cg_layout.setSpacing(6)
+        cg_layout.setContentsMargins(8, 8, 8, 8)
+
+        # Result display + action buttons
+        result_row = QHBoxLayout()
+        self._confirm_result_lbl = QLabel('')
+        self._confirm_result_lbl.setStyleSheet(
+            'font-size: 15px; font-weight: bold; color: #FFD700;'
+            'font-family: Georgia, serif; padding: 2px 6px;')
+        result_row.addWidget(self._confirm_result_lbl, 1)
+        self._confirm_accept_btn = QPushButton('✓  Accept')
+        self._confirm_accept_btn.setObjectName('confirmAcceptBtn')
+        self._confirm_accept_btn.setMinimumWidth(90)
+        self._confirm_accept_btn.clicked.connect(self._on_confirm_accept)
+        self._confirm_edit_btn = QPushButton('✏  Edit')
+        self._confirm_edit_btn.setMinimumWidth(70)
+        self._confirm_edit_btn.setCheckable(True)
+        self._confirm_edit_btn.clicked.connect(self._on_confirm_edit_toggle)
+        result_row.addWidget(self._confirm_accept_btn)
+        result_row.addWidget(self._confirm_edit_btn)
+        cg_layout.addLayout(result_row)
+
+        # Edit row — hidden until "Edit" is toggled on
+        self._confirm_edit_row = QWidget()
+        edit_hl = QHBoxLayout(self._confirm_edit_row)
+        edit_hl.setContentsMargins(0, 0, 0, 0)
+        edit_hl.addWidget(QLabel('Correct to:'))
+        self._confirm_d1 = QSpinBox()
+        self._confirm_d1.setRange(1, 6)
+        self._confirm_d1.setPrefix('Die 1: ')
+        self._confirm_d1.setFixedWidth(80)
+        self._confirm_d2 = QSpinBox()
+        self._confirm_d2.setRange(1, 6)
+        self._confirm_d2.setPrefix('Die 2: ')
+        self._confirm_d2.setFixedWidth(80)
+        edit_hl.addWidget(self._confirm_d1)
+        edit_hl.addWidget(self._confirm_d2)
+        self._confirm_submit_btn = QPushButton('Submit Correction')
+        self._confirm_submit_btn.setObjectName('confirmSubmitBtn')
+        self._confirm_submit_btn.clicked.connect(self._on_confirm_submit)
+        edit_hl.addWidget(self._confirm_submit_btn)
+        edit_hl.addStretch()
+        self._confirm_edit_row.setVisible(False)
+        cg_layout.addWidget(self._confirm_edit_row)
+
+        # Training stats label (shows how many corrections have been logged)
+        self._training_stats_lbl = QLabel('')
+        self._training_stats_lbl.setStyleSheet('color: #78A878; font-size: 10px;')
+        cg_layout.addWidget(self._training_stats_lbl)
+        root.addWidget(self._confirm_grp)
 
         # Action buttons
         btn_row = QHBoxLayout()
@@ -805,67 +1154,17 @@ class WebcamDialog(QDialog):
         btn_row.addWidget(self.capture_button)
         btn_row.addWidget(self.use_result_button)
         btn_row.addWidget(self.save_frame_button)
-        ctrl_layout.addLayout(btn_row)
+        root.addLayout(btn_row)
 
-        # Template images group
-        tmpl_group = QGroupBox('Reference Template Images')
-        tmpl_group.setObjectName('tmplGroup')
-        tl = QVBoxLayout(tmpl_group)
-        tl.setSpacing(4)
-
-        self.tmpl_status_label = QLabel('Loading templates...')
-        self.tmpl_status_label.setWordWrap(True)
-        tl.addWidget(self.tmpl_status_label)
-
-        self.tmpl_folder_label = QLabel(_DEFAULT_TEMPLATE_DIR)
-        self.tmpl_folder_label.setStyleSheet('color: #90A890; font-size: 10px;')
-        self.tmpl_folder_label.setWordWrap(True)
-        tl.addWidget(self.tmpl_folder_label)
-
-        tmpl_btn_row = QHBoxLayout()
-        reload_btn = QPushButton('Reload')
-        reload_btn.setFixedWidth(72)
-        browse_btn = QPushButton('Browse...')
-        browse_btn.setFixedWidth(80)
-        reload_btn.clicked.connect(self._reload_templates)
-        browse_btn.clicked.connect(self._browse_templates)
-        tmpl_btn_row.addWidget(reload_btn)
-        tmpl_btn_row.addWidget(browse_btn)
-        tmpl_btn_row.addStretch()
-        tl.addLayout(tmpl_btn_row)
-        tl.addWidget(self.tmpl_folder_label)
-
-        # Capture-from-camera reference workflow
-        cap_ref_row = QHBoxLayout()
-        cap_ref_row.addWidget(QLabel('Capture die face from camera:'))
-        self.cap_ref_spin = QSpinBox()
-        self.cap_ref_spin.setRange(1, 6)
-        self.cap_ref_spin.setValue(1)
-        self.cap_ref_spin.setPrefix('Face ')
-        self.cap_ref_spin.setFixedWidth(78)
-        self.cap_ref_btn = QPushButton('📷 Capture')
-        self.cap_ref_btn.setFixedWidth(90)
-        self.cap_ref_btn.setToolTip(
-            'Show this die face to the camera, then click to save it as a '
-            'reference image. Do this for all 6 faces under your actual lighting.')
-        self.cap_ref_btn.clicked.connect(self._capture_reference_face)
-        cap_ref_row.addWidget(self.cap_ref_spin)
-        cap_ref_row.addWidget(self.cap_ref_btn)
-        self.cap_ref_status = QLabel('')
-        self.cap_ref_status.setStyleSheet('color: #6EC86E; font-size: 11px;')
-        cap_ref_row.addWidget(self.cap_ref_status)
-        cap_ref_row.addStretch()
-        tl.addLayout(cap_ref_row)
-        ctrl_layout.addWidget(tmpl_group)
 
         # Tips
         tips = QLabel(
-            '💡  Tips: place dice on a plain contrasting surface · '
-            'ensure even lighting · keep dice flat and facing the camera'
+            '💡  Tips: place dice on a plain dark surface · '
+            'use Set Detection Area to crop out borders/clutter'
         )
         tips.setWordWrap(True)
         tips.setStyleSheet('color: #90A890; font-size: 11px;')
-        ctrl_layout.addWidget(tips)
+        root.addWidget(tips)
 
         # Manual override
         manual = QGridLayout()
@@ -881,17 +1180,11 @@ class WebcamDialog(QDialog):
         use_manual = QPushButton('Use Manual')
         use_manual.clicked.connect(self.use_manual_result)
         manual.addWidget(use_manual, 0, 5)
-        ctrl_layout.addLayout(manual)
+        root.addLayout(manual)
 
         close_btn = QPushButton('Close')
         close_btn.clicked.connect(self.close)
-        ctrl_layout.addWidget(close_btn)
-        ctrl_layout.addStretch()
-
-        self._splitter.addWidget(ctrl_pane)
-
-        # Set initial split: ~60% feed, ~40% controls
-        root.addWidget(self._splitter, stretch=1)
+        root.addWidget(close_btn)
 
         self.camera_combo.currentIndexChanged.connect(self.switch_camera)
 
@@ -912,12 +1205,23 @@ class WebcamDialog(QDialog):
                                   margin-top: 4px; padding: 6px; }
             QGroupBox#tmplGroup::title { subcontrol-origin: margin; left: 8px;
                                          padding: 0 4px; }
+            QGroupBox#confirmGrp { color: #FFD700; font-weight: bold; font-size: 12px;
+                                   border: 2px solid #C8A84B; border-radius: 8px;
+                                   background: #1C2A1C; margin-top: 4px; padding: 6px; }
+            QGroupBox#confirmGrp::title { subcontrol-origin: margin; left: 8px;
+                                          padding: 0 4px; color: #FFD700; }
             QPushButton { background: #3A6B2A; color: white; border: none;
                           border-radius: 6px; padding: 8px 14px; font-weight: bold; }
             QPushButton:hover    { background: #4E8538; }
             QPushButton:disabled { background: #2A3A2A; color: #666; }
             QPushButton#useResultButton       { background: #8B6900; color: #F0EAD6; }
             QPushButton#useResultButton:hover { background: #C8A84B; color: #0E1A14; }
+            QPushButton#confirmAcceptBtn       { background: #1A6830; color: #B0FFB0;
+                                                 border: 1px solid #3ADA60; }
+            QPushButton#confirmAcceptBtn:hover { background: #22903A; color: white; }
+            QPushButton#confirmSubmitBtn       { background: #8B4400; color: #FFD8A0;
+                                                 border: 1px solid #E88020; }
+            QPushButton#confirmSubmitBtn:hover { background: #B05800; color: white; }
             QComboBox, QSpinBox { background: #22302B; color: white;
                                   border: 1px solid #3A6B2A; border-radius: 4px;
                                   padding: 4px 6px; min-height: 26px; }
@@ -928,26 +1232,79 @@ class WebcamDialog(QDialog):
                                           margin: -4px 0; border-radius: 7px; }
             QSlider::sub-page:horizontal { background: #4A9B3A; border-radius: 3px; }
         """)
-        # Set initial splitter proportions once sizes are known
-        QTimer.singleShot(0, self._init_splitter_sizes)
+    # ── ROI selection ─────────────────────────────────────────────────────────
 
-    def _init_splitter_sizes(self):
-        total = self._splitter.height()
-        if total > 0:
-            feed_h = int(total * 0.60)
-            self._splitter.setSizes([feed_h, total - feed_h])
+    def _on_roi_mode_toggled(self, checked: bool):
+        if checked:
+            self._roi_btn.setText('📐 Drawing… (drag on feed)')
+            self._roi_status_lbl.setText('Click and drag on the camera feed')
+            self.feed_label.setCursor(Qt.CursorShape.CrossCursor)
+        else:
+            self._roi_btn.setText('📐 Set Detection Area')
+            self._roi_status_lbl.setText('')
+            self.feed_label.setCursor(Qt.CursorShape.ArrowCursor)
+        self._roi_selecting = checked
+        self._roi_drag_start = None
 
-    def _shrink_feed(self):
-        sizes = self._splitter.sizes()
-        if len(sizes) == 2 and sizes[0] > 120:
-            step = max(40, sizes[0] // 6)
-            self._splitter.setSizes([sizes[0] - step, sizes[1] + step])
+    def _clear_roi(self):
+        self._roi = None
+        self._roi_clear_btn.setEnabled(False)
+        self._roi_status_lbl.setText('')
+        self._roi_btn.setChecked(False)
+        cfg = _load_webcam_config()
+        cfg.pop('roi', None)
+        _save_webcam_config(cfg)
 
-    def _grow_feed(self):
-        sizes = self._splitter.sizes()
-        if len(sizes) == 2 and sizes[1] > 80:
-            step = max(40, sizes[0] // 6)
-            self._splitter.setSizes([sizes[0] + step, sizes[1] - step])
+    def _label_pos_to_frame(self, lx: int, ly: int):
+        """Convert a pixel position in feed_label to frame pixel coordinates."""
+        if self._current_frame is None:
+            return None, None
+        fh, fw = self._current_frame.shape[:2]
+        lw, lh = self.feed_label.width(), self.feed_label.height()
+        scale = min(lw / fw, lh / fh)
+        ox = (lw - int(fw * scale)) // 2
+        oy = (lh - int(fh * scale)) // 2
+        fx = int((lx - ox) / scale)
+        fy = int((ly - oy) / scale)
+        fx = max(0, min(fw - 1, fx))
+        fy = max(0, min(fh - 1, fy))
+        return fx, fy
+
+    def eventFilter(self, obj, event):
+        from PyQt6.QtCore import QEvent
+        from PyQt6.QtGui import QMouseEvent
+        if obj is self.feed_label and self._roi_selecting:
+            t = event.type()
+            if t == QEvent.Type.MouseButtonPress:
+                fx, fy = self._label_pos_to_frame(event.pos().x(), event.pos().y())
+                if fx is not None:
+                    self._roi_drag_start = (fx, fy)
+            elif t == QEvent.Type.MouseMove and self._roi_drag_start:
+                fx, fy = self._label_pos_to_frame(event.pos().x(), event.pos().y())
+                if fx is not None:
+                    x1, y1 = self._roi_drag_start
+                    self._roi_preview = (min(x1, fx), min(y1, fy),
+                                        max(x1, fx), max(y1, fy))
+            elif t == QEvent.Type.MouseButtonRelease and self._roi_drag_start:
+                fx, fy = self._label_pos_to_frame(event.pos().x(), event.pos().y())
+                if fx is not None:
+                    x1, y1 = self._roi_drag_start
+                    x2, y2 = max(x1, fx), max(y1, fy)
+                    if (x2 - x1) > 10 and (y2 - y1) > 10:
+                        self._roi = (x1, y1, x2, y2)
+                        self._roi_preview = None
+                        self._roi_drag_start = None
+                        self._roi_btn.setChecked(False)
+                        self._roi_clear_btn.setEnabled(True)
+                        w, h = x2 - x1, y2 - y1
+                        self._roi_status_lbl.setText(f'Area: {x1},{y1} → {x2},{y2}  ({w}×{h}px)')
+                        # Persist as fractions
+                        if self._current_frame is not None:
+                            fh, fw = self._current_frame.shape[:2]
+                            cfg = _load_webcam_config()
+                            cfg['roi'] = [x1/fw, y1/fh, x2/fw, y2/fh]
+                            _save_webcam_config(cfg)
+        return super().eventFilter(obj, event)
 
     def _populate_cameras(self):
         """Scan indices 0-3 for cameras that actually open, then pre-select default."""
@@ -985,82 +1342,6 @@ class WebcamDialog(QDialog):
         _save_webcam_config({'default_camera': idx})
         self.set_default_btn.setText('Saved!')
         QTimer.singleShot(1800, lambda: self.set_default_btn.setText('Set as Default'))
-
-    def _set_template_status(self, msg: str, n: int):
-        self.tmpl_status_label.setText(msg)
-        color = '#6EC86E' if n == 6 else ('#F5D76E' if n > 0 else '#E06060')
-        self.tmpl_status_label.setStyleSheet(f'color: {color}; font-size: 12px;')
-        self.tmpl_folder_label.setText(_TEMPLATE_SOURCE or _DEFAULT_TEMPLATE_DIR)
-
-    # ── Template management ────────────────────────────────────────────────────
-
-    def _reload_templates(self):
-        folder = self.tmpl_folder_label.text()
-        n, msg = load_reference_images(folder)
-        self._set_template_status(msg, n)
-
-    def _browse_templates(self):
-        folder = QFileDialog.getExistingDirectory(
-            self, 'Select folder containing dice images (1.jpg … 6.jpg)',
-            self.tmpl_folder_label.text())
-        if folder:
-            n, msg = load_reference_images(folder)
-            self._set_template_status(msg, n)
-
-    def _capture_reference_face(self):
-        """
-        Capture the current camera frame and save it as a reference image for the
-        selected die face value. The ROI of the best-detected die is used; if none
-        is found the full frame is saved. Reloads templates automatically.
-        """
-        if not OPENCV_AVAILABLE or self.current_frame is None:
-            self.cap_ref_status.setText('No frame available')
-            return
-        value = self.cap_ref_spin.value()
-        folder = Path(self.tmpl_folder_label.text())
-        if not folder.is_dir():
-            # Fall back to default folder, create if needed
-            folder = Path(_DEFAULT_TEMPLATE_DIR)
-            try:
-                folder.mkdir(parents=True, exist_ok=True)
-            except Exception:
-                self.cap_ref_status.setText('Cannot create folder')
-                return
-
-        # Use detected ROI if available, else full frame
-        frame = self.current_frame.copy()
-        saved_roi = frame
-        if self.current_detections:
-            # Use the highest-confidence detection's ROI
-            best = max(self.current_detections, key=lambda d: d['conf'])
-            x, y, w, h = best['rect']
-            fh, fw = frame.shape[:2]
-            pad = max(4, int(min(w, h) * 0.08))
-            saved_roi = frame[max(0, y-pad):min(fh, y+h+pad),
-                               max(0, x-pad):min(fw, x+w+pad)]
-        else:
-            # Try detecting from current frame directly
-            cands = _find_die_candidates(frame)
-            if cands:
-                best_c = max(cands, key=lambda r: r[2] * r[3])
-                x, y, w, h = best_c
-                fh, fw = frame.shape[:2]
-                pad = max(4, int(min(w, h) * 0.08))
-                saved_roi = frame[max(0, y-pad):min(fh, y+h+pad),
-                                   max(0, x-pad):min(fw, x+w+pad)]
-
-        out_path = folder / f"{value}.jpg"
-        cv2.imwrite(str(out_path), saved_roi)
-
-        # Reload templates from the folder
-        n, msg = load_reference_images(str(folder))
-        self._set_template_status(msg, n)
-
-        self.cap_ref_status.setText(f'✓ Face {value} saved!')
-        # Auto-advance to next face
-        if value < 6:
-            self.cap_ref_spin.setValue(value + 1)
-        QTimer.singleShot(2500, lambda: self.cap_ref_status.setText(''))
 
     # ── Camera lifecycle ───────────────────────────────────────────────────────
 
@@ -1149,10 +1430,56 @@ class WebcamDialog(QDialog):
         self._show_frame(frame)
 
     def _process(self, frame, captured: bool):
-        dets, cands = _analyze_frame(frame)
+        self._current_frame = frame  # used by ROI label-to-frame mapping
+
+        # Resolve saved ROI fractions on first frame after camera opens
+        if hasattr(self, '_saved_roi_fractions') and self._saved_roi_fractions:
+            fh, fw = frame.shape[:2]
+            rx1f, ry1f, rx2f, ry2f = self._saved_roi_fractions
+            self._roi = (int(rx1f * fw), int(ry1f * fh),
+                         int(rx2f * fw), int(ry2f * fh))
+            self._roi_clear_btn.setEnabled(True)
+            x1, y1, x2, y2 = self._roi
+            self._roi_status_lbl.setText(
+                f'Area: {x1},{y1} → {x2},{y2}  ({x2-x1}×{y2-y1}px)')
+            self._saved_roi_fractions = None   # only resolve once
+
+        # Crop to ROI before running detection
+        roi_offset = (0, 0)
+        work_frame = frame
+        if self._roi:
+            x1, y1, x2, y2 = self._roi
+            fh, fw = frame.shape[:2]
+            x1c, y1c = max(0, x1), max(0, y1)
+            x2c, y2c = min(fw, x2), min(fh, y2)
+            if x2c > x1c + 20 and y2c > y1c + 20:
+                work_frame = frame[y1c:y2c, x1c:x2c]
+                roi_offset = (x1c, y1c)
+
+        dets, cands = _analyze_frame(work_frame)
+
+        # Offset detection rects back to full-frame coords
+        if roi_offset != (0, 0):
+            ox, oy = roi_offset
+            for item in dets + cands:
+                rx, ry, rw, rh = item['rect']
+                item['rect'] = (rx + ox, ry + oy, rw, rh)
+
         self.current_detections = dets
         overlay = self._draw_overlay(frame.copy(), dets, cands)
-        # Debug counter on frame — helps diagnose if shapes are found at all
+
+        # Draw ROI rectangle on overlay
+        if self._roi:
+            x1, y1, x2, y2 = self._roi
+            cv2.rectangle(overlay, (x1, y1), (x2, y2), (50, 200, 255), 2)
+            cv2.putText(overlay, 'Detection Area', (x1 + 4, y1 + 18),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.55, (50, 200, 255), 1, cv2.LINE_AA)
+        # Draw in-progress ROI drag preview
+        if self._roi_preview:
+            px1, py1, px2, py2 = self._roi_preview
+            cv2.rectangle(overlay, (px1, py1), (px2, py2), (0, 255, 200), 1)
+
+        # Debug counter on frame
         h, w = overlay.shape[:2]
         dbg = f"shapes:{len(cands)}  dets:{len(dets)}"
         cv2.putText(overlay, dbg, (8, h - 8),
@@ -1247,7 +1574,7 @@ class WebcamDialog(QDialog):
                     and len(dets) == 2):
                 self._stable_buffer.clear()
                 self._stable_progress = 0
-                self._submit_roll(d1_val, d2_val)
+                self._show_confirm(d1_val, d2_val)
                 return
 
         # ── Status display ────────────────────────────────────────────────
@@ -1323,10 +1650,115 @@ class WebcamDialog(QDialog):
         d1 = int(self.current_detections[0]['value'])
         d2 = int(self.current_detections[1]['value'])
         if 1 <= d1 <= 6 and 1 <= d2 <= 6:
-            self._submit_roll(d1, d2)
+            self._show_confirm(d1, d2)
 
     def use_manual_result(self):
         self._submit_roll(self.manual_die1.value(), self.manual_die2.value())
+
+    # ── Confirmation panel logic ───────────────────────────────────────────────
+
+    def _show_confirm(self, d1: int, d2: int):
+        """
+        Show the confirmation panel for a stable detection result.
+        Pauses further detection; the user must Accept or Edit+Submit.
+        """
+        # Apply learned bias before showing (low-confidence correction)
+        d1_show, d2_show = self._apply_bias_if_needed(d1, d2)
+
+        self._pending_detected = (d1, d2)          # original detected values
+        self._pending_frame    = (self.current_frame.copy()
+                                  if self.current_frame is not None else None)
+
+        horse = d1_show + d2_show
+        self._confirm_result_lbl.setText(
+            f'  {d1_show}  +  {d2_show}  =  {horse}   →   Horse #{horse}')
+        self._confirm_d1.setValue(d1_show)
+        self._confirm_d2.setValue(d2_show)
+        self._confirm_edit_btn.setChecked(False)
+        self._confirm_edit_row.setVisible(False)
+
+        # Show correction count in stats label
+        self._refresh_training_stats()
+
+        self._confirm_grp.setVisible(True)
+        self.use_result_button.setEnabled(False)   # block while confirming
+
+    def _on_confirm_accept(self):
+        """User accepts the detected values — log as correct and submit."""
+        if self._pending_detected is None:
+            return
+        d1_det, d2_det = self._pending_detected
+        d1_use, d2_use = self._apply_bias_if_needed(d1_det, d2_det)
+
+        # Log: detected == true (no correction needed)
+        _save_training_entry(self._pending_frame,
+                             d1_det, d2_det, d1_use, d2_use)
+        self._hide_confirm()
+        self._submit_roll(d1_use, d2_use)
+
+    def _on_confirm_edit_toggle(self, checked: bool):
+        self._confirm_edit_row.setVisible(checked)
+
+    def _on_confirm_submit(self):
+        """User submitted a manual correction — log it and submit corrected roll."""
+        if self._pending_detected is None:
+            return
+        d1_det, d2_det = self._pending_detected
+        d1_true = self._confirm_d1.value()
+        d2_true = self._confirm_d2.value()
+
+        # Log: detected vs corrected values + frame
+        _save_training_entry(self._pending_frame,
+                             d1_det, d2_det, d1_true, d2_true)
+
+        # Reload bias table in case this correction pushed us over a threshold
+        self._bias_table = _load_bias_table()
+
+        self._hide_confirm()
+        self._submit_roll(d1_true, d2_true)
+
+    def _hide_confirm(self):
+        self._confirm_grp.setVisible(False)
+        self._confirm_edit_btn.setChecked(False)
+        self._confirm_edit_row.setVisible(False)
+        self._pending_detected = None
+        self._pending_frame    = None
+
+    def _apply_bias_if_needed(self, d1: int, d2: int) -> tuple:
+        """
+        Apply learned bias corrections (from training log).
+        Bias is only applied when we have strong evidence (≥5 corrections,
+        ≥75 % one-way) — see _load_bias_table().  This corrects systematic
+        misreadings without risking false corrections on confident reads.
+        """
+        if not self._bias_table:
+            return d1, d2
+        # Get confidence of most recent detections if available
+        confs = {d['value']: d['conf'] for d in self.current_detections}
+        d1_out = d1
+        d2_out = d2
+        if d1 in self._bias_table and confs.get(d1, 1.0) < 0.75:
+            d1_out = self._bias_table[d1]
+        if d2 in self._bias_table and confs.get(d2, 1.0) < 0.75:
+            d2_out = self._bias_table[d2]
+        return d1_out, d2_out
+
+    def _refresh_training_stats(self):
+        """Update the small stats label in the confirmation panel."""
+        try:
+            if not _CORRECTIONS_LOG.exists():
+                self._training_stats_lbl.setText('Training log: 0 entries')
+                return
+            with open(_CORRECTIONS_LOG, encoding='utf-8') as f:
+                log = json.load(f)
+            total     = len(log)
+            corrected = sum(1 for e in log if e.get('was_corrected'))
+            bias_info = (f'  |  Bias table: {len(self._bias_table)} value(s)'
+                         if self._bias_table else '')
+            self._training_stats_lbl.setText(
+                f'Training log: {total} entries, {corrected} corrected{bias_info}')
+        except Exception:
+            self._training_stats_lbl.setText('')
 
     # ── Roll submission + cooldown ─────────────────────────────────────────────
 

@@ -3,24 +3,32 @@ from __future__ import annotations
 from PyQt6.QtCore import Qt, QTimer
 from PyQt6.QtGui import QKeySequence, QShortcut
 from PyQt6.QtWidgets import (
-    QHBoxLayout, QMainWindow, QMessageBox, QStatusBar, QWidget,
+    QHBoxLayout, QMainWindow, QMessageBox, QStatusBar, QVBoxLayout, QLabel, QWidget,
 )
 
 from board_widget   import BoardWidget
-from control_panel  import ControlPanel
+from control_panel  import ControlPanel, CompactRacePanel, DiceWidget
 from game_state     import GameState
 from styles         import APP_STYLE
+
+
 
 
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle('Derby Dash')
+        self.setWindowTitle('Truck Dash')
         self.setMinimumSize(800, 480)
         self.game = GameState()
 
         self._admin_dialog  = None
         self._webcam_dialog = None
+
+        # Auto-roll state
+        self._auto_rolling  = False
+        self._auto_timer    = QTimer(self)
+        self._auto_timer.setSingleShot(True)
+        self._auto_timer.timeout.connect(self._auto_roll_step)
 
         self._build_ui()
         self.setStyleSheet(APP_STYLE)
@@ -35,31 +43,107 @@ class MainWindow(QMainWindow):
     def _build_ui(self):
         central = QWidget()
         self.setCentralWidget(central)
-        layout = QHBoxLayout(central)
+        outer = QVBoxLayout(central)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+
+        # ── Main row: board + compact panel ───────────────────────────────
+        row = QWidget()
+        layout = QHBoxLayout(row)
         layout.setContentsMargins(8, 8, 8, 8)
         layout.setSpacing(8)
 
-        # Board fills all available space; panel takes ~20 %
+        # Board fills most space
         self.board = BoardWidget(self.game)
         layout.addWidget(self.board, stretch=5)
 
+        # Slim right panel: dice result + standings only
+        self.compact_panel = CompactRacePanel(self.game)
+        self.compact_panel.controls_requested.connect(self._show_controls)
+        layout.addWidget(self.compact_panel, stretch=1)
+
+        outer.addWidget(row, stretch=1)
+
+        # ── Winner banner (hidden until a race ends) ───────────────────────
+        self._winner_banner = QLabel('')
+        self._winner_banner.setObjectName('winner_banner')
+        self._winner_banner.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._winner_banner.setWordWrap(True)
+        self._winner_banner.setFixedHeight(54)
+        self._winner_banner.hide()
+        outer.addWidget(self._winner_banner)
+
+        # ── Full control window — lives on the second screen ──────────────
         self.panel = ControlPanel(self.game)
         self.panel.roll_requested.connect(self._do_roll)
+        self.panel.auto_roll_requested.connect(self._toggle_auto_roll)
         self.panel.reset_requested.connect(self._do_reset)
         self.panel.admin_requested.connect(self._open_admin)
         self.panel.webcam_requested.connect(self._open_webcam)
         self.panel.history_requested.connect(self._open_history)
-        layout.addWidget(self.panel, stretch=1)
+        self.panel.show_on_second_screen()
 
         self.status_bar = QStatusBar()
         self.setStatusBar(self.status_bar)
-        self.status_bar.showMessage('Welcome to Derby Dash!  Click Roll Dice to begin.   [ F11 = full screen ]')
+        self.status_bar.showMessage('Welcome to Truck Dash!  Click Roll Dice to begin.   [ F11 = full screen ]')
 
     def _toggle_fullscreen(self):
         if self.isFullScreen():
             self.showMaximized()
         else:
             self.showFullScreen()
+
+    def _show_controls(self):
+        """Raise (or re-show) the control window."""
+        self.panel.show()
+        self.panel.raise_()
+        self.panel.activateWindow()
+
+    # ── Auto Roll ──────────────────────────────────────────────────────────
+
+    def _toggle_auto_roll(self):
+        if self._auto_rolling:
+            self._stop_auto_roll()
+        elif self.game.phase == 'racing':
+            self._start_auto_roll()
+
+    def _start_auto_roll(self):
+        self._auto_rolling = True
+        self._refresh()
+        self._auto_roll_step()   # fire the first roll immediately
+
+    def _stop_auto_roll(self):
+        self._auto_rolling = False
+        self._auto_timer.stop()
+        self.compact_panel.stop_animation()
+        self._refresh()
+        self.status_bar.showMessage('Auto Roll stopped.')
+
+    def _auto_roll_step(self):
+        if not self._auto_rolling or self.game.phase != 'racing':
+            self._stop_auto_roll()
+            return
+        # Animate dice first; result is applied when animation finishes
+        self.compact_panel.show_roll_animation(on_complete=self._apply_auto_roll)
+        self.panel.show_roll_animation()
+
+    def _apply_auto_roll(self):
+        if not self._auto_rolling:
+            return
+        if self.game.phase != 'racing':
+            self._stop_auto_roll()
+            return
+        d1, d2 = self.game.roll_dice()
+        horse, won = self.game.apply_roll(d1, d2)
+        self.status_bar.showMessage(
+            f'Auto Roll #{len(self.game.roll_log)}:  {d1} + {d2} = {d1+d2}  →  Truck #{horse} advances!'
+        )
+        self._refresh()
+        if won:
+            self._auto_rolling = False
+            QTimer.singleShot(1200, lambda: self._announce_winner(horse))
+        else:
+            self._auto_timer.start(1200)
 
     # ── Game actions ───────────────────────────────────────────────────────
 
@@ -68,13 +152,14 @@ class MainWindow(QMainWindow):
             return
         self.panel.btn_roll.setEnabled(False)
         self.panel.show_roll_animation()
+        self.compact_panel.show_roll_animation()
         QTimer.singleShot(480, self._apply_roll)
 
     def _apply_roll(self):
         d1, d2 = self.game.roll_dice()
         horse, won = self.game.apply_roll(d1, d2)
         self.status_bar.showMessage(
-            f'Rolled  {d1} + {d2} = {d1+d2}  →  Horse #{horse} advances!'
+            f'Rolled  {d1} + {d2} = {d1+d2}  →  Truck #{horse} advances!'
         )
         self._refresh()
         if won:
@@ -87,19 +172,22 @@ class MainWindow(QMainWindow):
             return
         horse, won = self.game.apply_roll(d1, d2)
         self.status_bar.showMessage(
-            f'Webcam roll:  {d1} + {d2} = {d1+d2}  →  Horse #{horse} advances!'
+            f'Webcam roll:  {d1} + {d2} = {d1+d2}  →  Truck #{horse} advances!'
         )
         self._refresh()
         if won:
             self._announce_winner(horse)
 
     def _do_reset(self):
+        if self._auto_rolling:
+            self._stop_auto_roll()
         reply = QMessageBox.question(
             self, 'New Race', 'Start a new race?  All positions will be reset.',
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
         )
         if reply == QMessageBox.StandardButton.Yes:
             self.game.reset()
+            self._winner_banner.hide()
             self.status_bar.showMessage('New race!  Click Roll Dice to begin.')
             self._refresh()
 
@@ -111,21 +199,26 @@ class MainWindow(QMainWindow):
         combos = COMBINATIONS[horse]
         odds   = 36 // combos
 
-        # Save to CSV before showing popup
         try:
-            csv_path = save_race(self.game)
-            saved_msg = f'\n\nRace saved to:\n{csv_path}'
-        except Exception as exc:
-            saved_msg = f'\n\n(Could not save history: {exc})'
+            save_race(self.game)
+        except Exception:
+            pass
 
-        msg = (
-            f'🏆  Horse #{horse} wins the race!\n\n'
-            f'Dice combinations: {combos} out of 36\n'
-            f'Approximate odds:  {odds}:1\n\n'
+        banner_text = (
+            f'🏆  TRUCK #{horse} WINS!     '
+            f'Combos: {combos}/36  •  Odds ≈ {odds}:1  •  '
             f'Total rolls: {len(self.game.roll_log)}'
-            f'{saved_msg}'
         )
-        QMessageBox.information(self, '🏁  Race Over!', msg)
+        self._winner_banner.setText(banner_text)
+        self._winner_banner.setStyleSheet(
+            'background: qlineargradient(x1:0,y1:0,x2:1,y2:0,'
+            'stop:0 #8B4A00, stop:0.3 #C07800, stop:0.5 #E8C030, '
+            'stop:0.7 #C07800, stop:1 #8B4A00);'
+            'color: #1A0A00; font-size: 18px; font-weight: bold;'
+            'font-family: Georgia, serif;'
+            'border-top: 3px solid #FFD700; padding: 6px 16px;'
+        )
+        self._winner_banner.show()
         self._refresh()
 
     # ── Dialogs ────────────────────────────────────────────────────────────
@@ -166,5 +259,6 @@ class MainWindow(QMainWindow):
     # ── Refresh ────────────────────────────────────────────────────────────
 
     def _refresh(self):
-        self.panel.refresh()
+        self.panel.refresh(auto_rolling=self._auto_rolling)
+        self.compact_panel.refresh()
         self.board.refresh()

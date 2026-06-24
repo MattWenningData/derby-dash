@@ -1,0 +1,110 @@
+[
+  {
+    "timestamp": "2026-06-23T19:47:35.163688",
+    "detected_d1": 6,
+    "detected_d2": 5,
+    "true_d1": 6,
+    "true_d2": 5,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_194735_157907.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T19:47:54.500346",
+    "detected_d1": 5,
+    "detected_d2": 5,
+    "true_d1": 5,
+    "true_d2": 5,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_194754_494808.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T19:49:40.675047",
+    "detected_d1": 4,
+    "detected_d2": 1,
+    "true_d1": 4,
+    "true_d2": 1,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_194940_651913.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T19:50:13.131643",
+    "detected_d1": 1,
+    "detected_d2": 3,
+    "true_d1": 3,
+    "true_d2": 3,
+    "was_corrected": true,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_195013_124645.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T19:50:26.326804",
+    "detected_d1": 1,
+    "detected_d2": 6,
+    "true_d1": 1,
+    "true_d2": 6,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_195026_321494.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T19:50:39.503182",
+    "detected_d1": 5,
+    "detected_d2": 5,
+    "true_d1": 5,
+    "true_d2": 5,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_195039_498897.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T20:47:54.769478",
+    "detected_d1": 5,
+    "detected_d2": 1,
+    "true_d1": 1,
+    "true_d2": 1,
+    "was_corrected": true,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_204754_763594.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T20:49:49.265638",
+    "detected_d1": 6,
+    "detected_d2": 6,
+    "true_d1": 6,
+    "true_d2": 6,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_204949_260749.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T20:50:07.962149",
+    "detected_d1": 5,
+    "detected_d2": 5,
+    "true_d1": 5,
+    "true_d2": 5,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_205007_957846.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T20:50:31.776833",
+    "detected_d1": 5,
+    "detected_d2": 5,
+    "true_d1": 5,
+    "true_d2": 5,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_205031_771140.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T20:54:24.087391",
+    "detected_d1": 1,
+    "detected_d2": 6,
+    "true_d1": 1,
+    "true_d2": 6,
+    "was_corrected": false,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_205424_082939.jpg"
+  },
+  {
+    "timestamp": "2026-06-23T20:57:16.968198",
+    "detected_d1": 5,
+    "detected_d2": 4,
+    "true_d1": 3,
+    "true_d2": 4,
+    "was_corrected": true,
+    "frame_path": "c:\\GHCLI\\horse-race-app\\training_data\\frames\\frame_20260623_205716_953838.jpg"
+  }
+]

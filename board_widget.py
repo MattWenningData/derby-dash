@@ -137,9 +137,9 @@ class BoardWidget(QWidget):
         font.setLetterSpacing(QFont.SpacingType.AbsoluteSpacing, 3.0)
         painter.setFont(font)
         painter.setPen(QColor(60, 35, 0, 140))
-        painter.drawText(rect.translated(1.5, 2.5), Qt.AlignmentFlag.AlignCenter, '🏇  DERBY DASH')
+        painter.drawText(rect.translated(1.5, 2.5), Qt.AlignmentFlag.AlignCenter, '🚒  TRUCK DASH')
         painter.setPen(QColor('#EAC848'))
-        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, '🏇  DERBY DASH')
+        painter.drawText(rect, Qt.AlignmentFlag.AlignCenter, '🚒  TRUCK DASH')
 
     # ── Main race board ───────────────────────────────────────────────────────
 
@@ -275,7 +275,7 @@ class BoardWidget(QWidget):
             pos     = max(0, min(raw_pos, tlen))
             px      = race_start + pos * race_w / tlen
             winner  = (getattr(self.game_state, 'winner', None) == horse and raw_pos >= tlen)
-            self._draw_horse_piece(painter, horse, QPointF(px, cy), piece_r, winner, finish_rect)
+            self._draw_truck_piece(painter, horse, QPointF(px, cy), piece_r, winner, finish_rect)
 
     def _draw_checkered_finish(self, painter: QPainter, rect: QRectF):
         cell = max(8.0, min(13.0, rect.width() / 4.2))
@@ -310,10 +310,15 @@ class BoardWidget(QWidget):
         gate_w   = max(64.0, min(90.0, race_rect.width() * 0.088))
         finish_w = max(60.0, min(82.0, race_rect.width() * 0.078))
 
-        # Font scales with footer height; clamp so text never overflows its box.
-        font_pt  = min(rect.height() * 0.52,
-                       gate_w   * 0.30,    # won't overflow START box
-                       finish_w * 0.30)    # won't overflow FINISH box
+        # Give the text boxes 1.6× the column width so letters are never clipped,
+        # centred on the column midpoint so they stay visually aligned.
+        label_box_w = max(gate_w, finish_w) * 1.6
+
+        # Font scales with footer height; clamp off the column widths so text
+        # stays visually proportional to the columns even with the wider draw rect.
+        font_pt  = min(rect.height() * 0.46,
+                       gate_w   * 0.26,
+                       finish_w * 0.26)
         font_pt  = max(7.0, font_pt)
 
         font = QFont('Georgia')
@@ -323,8 +328,11 @@ class BoardWidget(QWidget):
         painter.setFont(font)
         painter.setPen(QColor('#C8A84B'))
 
-        start_box  = QRectF(race_rect.left(),              rect.top(), gate_w,   rect.height())
-        finish_box = QRectF(race_rect.right() - finish_w,  rect.top(), finish_w, rect.height())
+        start_cx   = race_rect.left()  + gate_w   / 2.0
+        finish_cx  = race_rect.right() - finish_w / 2.0
+
+        start_box  = QRectF(race_rect.left(),                    rect.top(), label_box_w, rect.height())
+        finish_box = QRectF(race_rect.right() - label_box_w,     rect.top(), label_box_w, rect.height())
 
         # Drop-shadow offset for readability
         shadow_col = QColor(0, 0, 0, 130)
@@ -383,12 +391,35 @@ class BoardWidget(QWidget):
         painter.drawEllipse(center, r, r)
         painter.restore()
 
-    # ── Horse piece ────────────────────────────────────────────────────────────
+    # ── Truck piece (realistic pumper silhouette) ──────────────────────────────
 
-    def _draw_horse_piece(self, painter: QPainter, horse: int, center: QPointF,
+    def _draw_truck_piece(self, painter: QPainter, horse: int, center: QPointF,
                           radius: float, is_winner: bool, finish_rect: QRectF):
         painter.save()
-        painter.setPen(QPen(Qt.PenStyle.NoPen))
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        painter.setPen(Qt.PenStyle.NoPen)
+
+        cx, cy = center.x(), center.y()
+
+        # ── Dimensions ────────────────────────────────────────────────────
+        # Realistic proportions: wide and low (not toy-tall)
+        tw   = radius * 3.6     # total width
+        th   = radius * 1.3     # body height (low-slung)
+        bx   = cx - tw / 2      # left edge
+        by   = cy - th / 2      # body top
+        wr   = th * 0.30        # wheel radius
+
+        # Body zones
+        hood_w  = tw * 0.20     # hood in front of cab
+        cab_w   = tw * 0.22     # cab width
+        body_w  = tw - hood_w - cab_w   # equipment/pump body
+        cab_x   = bx + body_w
+        hood_x  = cab_x + cab_w
+
+        # Cab is only slightly taller than body
+        cab_h_extra = th * 0.32
+        cab_top     = by - cab_h_extra
+        cab_h       = th + cab_h_extra
 
         # ── Winner pulse glow ──────────────────────────────────────────────
         if is_winner:
@@ -399,70 +430,183 @@ class BoardWidget(QWidget):
                 painter.drawEllipse(center, glow_r * r_mult, glow_r * r_mult)
 
         # ── Drop shadow ────────────────────────────────────────────────────
-        shadow_c = QPointF(center.x() + radius * 0.20, center.y() + radius * 0.25)
-        shadow_g = QRadialGradient(shadow_c, radius * 1.1)
-        shadow_g.setColorAt(0.0, QColor(0, 0, 0, 120))
-        shadow_g.setColorAt(1.0, QColor(0, 0, 0, 0))
-        painter.setBrush(shadow_g)
-        painter.drawEllipse(shadow_c, radius * 1.1, radius * 1.1)
+        shadow = QPainterPath()
+        shadow.addRoundedRect(QRectF(bx + 2, by + th * 0.6, tw, th * 0.55), 2, 2)
+        painter.setBrush(QColor(0, 0, 0, 80))
+        painter.drawPath(shadow)
 
-        # ── Outer border ring ──────────────────────────────────────────────
-        ring_color = QColor('#FFD700') if is_winner else QColor(255, 255, 255, 210)
-        painter.setBrush(ring_color)
-        painter.drawEllipse(center, radius, radius)
+        # ── Equipment body (rear pumper section) ──────────────────────────
+        body_col  = QColor('#C01800')
+        body_dark = QColor('#8A0F00')
+        bg = QLinearGradient(bx, by, bx, by + th)
+        bg.setColorAt(0.0, QColor('#D83020'))
+        bg.setColorAt(0.35, body_col)
+        bg.setColorAt(1.0, body_dark)
+        painter.setBrush(bg)
+        body_path = QPainterPath()
+        body_path.addRect(QRectF(bx, by, body_w + 1, th))
+        painter.drawPath(body_path)
 
-        # ── Piece body — glossy plastic look ──────────────────────────────
-        base  = QColor(HORSE_COLORS[horse])
-        inner = radius * 0.82
-        body_g = QRadialGradient(
-            center.x() - inner * 0.28, center.y() - inner * 0.32, inner * 1.65
-        )
-        body_g.setColorAt(0.00, base.lighter(180))
-        body_g.setColorAt(0.30, base.lighter(120))
-        body_g.setColorAt(0.65, base)
-        body_g.setColorAt(1.00, base.darker(175))
-        painter.setBrush(body_g)
-        painter.drawEllipse(center, inner, inner)
+        # Equipment compartment door lines (vertical panels)
+        door_pen = QPen(QColor(0, 0, 0, 70), max(0.5, radius * 0.04))
+        painter.setPen(door_pen)
+        n_doors = max(2, int(body_w / (th * 0.9)))
+        for di in range(1, n_doors):
+            dx = bx + di * body_w / n_doors
+            painter.drawLine(QPointF(dx, by + th * 0.08), QPointF(dx, by + th * 0.92))
+        # Horizontal trim stripe
+        painter.setPen(QPen(QColor(220, 200, 140, 160), max(0.8, radius * 0.06)))
+        stripe_y = by + th * 0.62
+        painter.drawLine(QPointF(bx, stripe_y), QPointF(bx + body_w, stripe_y))
+        painter.setPen(Qt.PenStyle.NoPen)
 
-        # ── Bounce light (bottom edge) ─────────────────────────────────────
-        bounce_c = QPointF(center.x() + inner * 0.1, center.y() + inner * 0.55)
-        bounce_g = QRadialGradient(bounce_c, inner * 0.6)
-        bounce_g.setColorAt(0.0, QColor(255, 255, 255, 55))
-        bounce_g.setColorAt(1.0, QColor(255, 255, 255, 0))
-        painter.setBrush(bounce_g)
-        painter.drawEllipse(center, inner, inner)
+        # ── Cab ────────────────────────────────────────────────────────────
+        cab_bg = QLinearGradient(cab_x, cab_top, cab_x, cab_top + cab_h)
+        cab_bg.setColorAt(0.0, QColor('#E03020'))
+        cab_bg.setColorAt(0.5, body_col)
+        cab_bg.setColorAt(1.0, body_dark)
+        painter.setBrush(cab_bg)
+        cab_path = QPainterPath()
+        # Cab shape: square bottom, slightly angled top-front corner
+        cab_path.moveTo(cab_x, by + th)            # bottom-left
+        cab_path.lineTo(cab_x + cab_w, by + th)    # bottom-right (meets hood)
+        cab_path.lineTo(cab_x + cab_w, cab_top + cab_h * 0.18)  # top-right (angled)
+        cab_path.lineTo(cab_x + cab_w * 0.72, cab_top)          # roof front corner
+        cab_path.lineTo(cab_x, cab_top)            # roof rear
+        cab_path.closeSubpath()
+        painter.drawPath(cab_path)
 
-        # ── Specular highlight (top-left) ──────────────────────────────────
-        hi_c = QPointF(center.x() - inner * 0.33, center.y() - inner * 0.38)
-        hi_g = QRadialGradient(hi_c, inner * 0.52)
-        hi_g.setColorAt(0.0, QColor(255, 255, 255, 185))
-        hi_g.setColorAt(0.5, QColor(255, 255, 255, 60))
-        hi_g.setColorAt(1.0, QColor(255, 255, 255, 0))
-        painter.setBrush(hi_g)
-        painter.drawEllipse(hi_c, inner * 0.52, inner * 0.52)
+        # ── Windshield (angled, tinted glass) ─────────────────────────────
+        ws_path = QPainterPath()
+        ws_path.moveTo(cab_x + cab_w * 0.76, cab_top + cab_h * 0.20)
+        ws_path.lineTo(cab_x + cab_w * 0.94, cab_top + cab_h * 0.35)
+        ws_path.lineTo(cab_x + cab_w * 0.94, cab_top + cab_h * 0.72)
+        ws_path.lineTo(cab_x + cab_w * 0.76, cab_top + cab_h * 0.72)
+        ws_path.closeSubpath()
+        painter.setBrush(QColor(160, 220, 255, 155))
+        painter.drawPath(ws_path)
+        # Glass reflection
+        painter.setBrush(QColor(255, 255, 255, 45))
+        ws_hi = QPainterPath()
+        ws_hi.moveTo(cab_x + cab_w * 0.77, cab_top + cab_h * 0.22)
+        ws_hi.lineTo(cab_x + cab_w * 0.88, cab_top + cab_h * 0.32)
+        ws_hi.lineTo(cab_x + cab_w * 0.88, cab_top + cab_h * 0.48)
+        ws_hi.lineTo(cab_x + cab_w * 0.77, cab_top + cab_h * 0.38)
+        ws_hi.closeSubpath()
+        painter.drawPath(ws_hi)
 
-        # ── Horse number ───────────────────────────────────────────────────
+        # Side window (cab left)
+        sw_path = QPainterPath()
+        sw_path.addRoundedRect(
+            QRectF(cab_x + cab_w * 0.05, cab_top + cab_h * 0.15,
+                   cab_w * 0.50, cab_h * 0.46), 1, 1)
+        painter.setBrush(QColor(140, 200, 255, 140))
+        painter.drawPath(sw_path)
+
+        # ── Hood ───────────────────────────────────────────────────────────
+        hood_path = QPainterPath()
+        hood_path.moveTo(hood_x, by)
+        hood_path.lineTo(hood_x + hood_w * 0.88, by)       # hood top
+        hood_path.lineTo(hood_x + hood_w, by + th * 0.32)  # nose slope
+        hood_path.lineTo(hood_x + hood_w, by + th)         # bumper bottom
+        hood_path.lineTo(hood_x, by + th)
+        hood_path.closeSubpath()
+        hood_g = QLinearGradient(hood_x, by, hood_x, by + th)
+        hood_g.setColorAt(0.0, QColor('#D82818'))
+        hood_g.setColorAt(1.0, body_dark)
+        painter.setBrush(hood_g)
+        painter.drawPath(hood_path)
+
+        # Chrome grille/bumper strip at nose
+        bumper_x = hood_x + hood_w * 0.78
+        bumper_y = by + th * 0.52
+        bumper_h = th * 0.48
+        painter.setBrush(QLinearGradient(bumper_x, bumper_y, bumper_x + hood_w * 0.22, bumper_y))
+        chrome = QLinearGradient(bumper_x, bumper_y, bumper_x, bumper_y + bumper_h)
+        chrome.setColorAt(0.0, QColor(230, 230, 230))
+        chrome.setColorAt(0.5, QColor(180, 180, 180))
+        chrome.setColorAt(1.0, QColor(120, 120, 120))
+        painter.setBrush(chrome)
+        painter.drawRect(QRectF(bumper_x, bumper_y, hood_w * 0.22, bumper_h))
+
+        # ── Wheel arches ──────────────────────────────────────────────────
+        wy   = by + th - wr * 0.1
+        arch_r = wr * 1.25
+        for wx in (bx + body_w * 0.25, cab_x + cab_w * 0.50):
+            # Arch cutout (dark)
+            painter.setBrush(QColor(15, 10, 8))
+            painter.drawEllipse(QPointF(wx, wy), arch_r, arch_r * 0.92)
+            # Tyre
+            painter.setBrush(QColor(28, 25, 22))
+            painter.drawEllipse(QPointF(wx, wy), wr, wr * 0.95)
+            # Rim
+            rim_g = QRadialGradient(wx - wr * 0.15, wy - wr * 0.15, wr * 1.1)
+            rim_g.setColorAt(0.0, QColor(210, 210, 210))
+            rim_g.setColorAt(0.45, QColor(170, 170, 170))
+            rim_g.setColorAt(1.0,  QColor(90,  90,  90))
+            painter.setBrush(rim_g)
+            painter.drawEllipse(QPointF(wx, wy), wr * 0.52, wr * 0.50)
+            # Hub cap dot
+            painter.setBrush(QColor(200, 200, 200))
+            painter.drawEllipse(QPointF(wx, wy), wr * 0.14, wr * 0.14)
+
+        # ── LED light bar (full-width on cab roof) ─────────────────────────
+        lb_x = cab_x + cab_w * 0.05
+        lb_w = cab_w * 0.82
+        lb_y = cab_top - max(1.5, radius * 0.14)
+        lb_h = max(1.5, radius * 0.16)
+        # Bar housing
+        painter.setBrush(QColor(30, 30, 30))
+        painter.drawRoundedRect(QRectF(lb_x, lb_y, lb_w, lb_h * 1.6), 1, 1)
+        # Red LEDs left half
+        painter.setBrush(QColor(255, 50, 50, 230))
+        painter.drawRoundedRect(QRectF(lb_x + lb_w * 0.03, lb_y + lb_h * 0.2,
+                                       lb_w * 0.45, lb_h), 1, 1)
+        # Blue LEDs right half
+        painter.setBrush(QColor(60, 120, 255, 230))
+        painter.drawRoundedRect(QRectF(lb_x + lb_w * 0.52, lb_y + lb_h * 0.2,
+                                       lb_w * 0.45, lb_h), 1, 1)
+
+        # ── Roof-mounted ladder on body ────────────────────────────────────
+        if body_w > 14:
+            ly  = by - max(1.2, radius * 0.06)
+            lh  = max(1.8, radius * 0.12)
+            painter.setPen(QPen(QColor(180, 155, 90, 200), max(0.6, radius * 0.05)))
+            painter.drawLine(QPointF(bx + 2, ly),      QPointF(bx + body_w - 2, ly))
+            painter.drawLine(QPointF(bx + 2, ly + lh), QPointF(bx + body_w - 2, ly + lh))
+            rungs = max(3, int(body_w / 6))
+            for ri in range(rungs + 1):
+                rx = bx + 2 + ri * (body_w - 4) / max(1, rungs)
+                painter.drawLine(QPointF(rx, ly), QPointF(rx, ly + lh))
+            painter.setPen(Qt.PenStyle.NoPen)
+
+        # ── Truck number ───────────────────────────────────────────────────
+        painter.setPen(Qt.PenStyle.NoPen)
         font = QFont('Arial Black')
         font.setBold(True)
-        font.setPointSizeF(max(6.5, inner * (0.88 if horse < 10 else 0.70)))
+        font.setPointSizeF(max(5.0, th * 0.50 * (0.78 if horse >= 10 else 1.0)))
         painter.setFont(font)
-        tr = QRectF(center.x() - inner, center.y() - inner, inner * 2, inner * 2)
-        painter.setPen(QColor(0, 0, 0, 170))
-        painter.drawText(tr.translated(0.7, 1.0), Qt.AlignmentFlag.AlignCenter, str(horse))
-        painter.setPen(Qt.GlobalColor.white)
-        painter.drawText(tr, Qt.AlignmentFlag.AlignCenter, str(horse))
+        nr = QRectF(bx + body_w * 0.08, by, body_w * 0.84, th * 0.58)
+        painter.setPen(QColor(0, 0, 0, 130))
+        painter.drawText(nr.translated(0.5, 0.8), Qt.AlignmentFlag.AlignCenter, str(horse))
+        painter.setPen(QColor(255, 255, 220))
+        painter.drawText(nr, Qt.AlignmentFlag.AlignCenter, str(horse))
 
         # ── Winner trophy ──────────────────────────────────────────────────
         if is_winner:
             tf = QFont('Segoe UI Emoji')
             tf.setPointSizeF(max(8.0, radius * 0.90))
             painter.setFont(tf)
-            tx = center.x() + radius + 5.0
+            tx = cx + tw / 2 + 4.0
             if tx + radius * 1.5 > finish_rect.left():
-                tx = center.x() - radius * 2.1
+                tx = cx - tw / 2 - radius * 2.0
             painter.drawText(
-                QRectF(tx, center.y() - radius * 0.9, radius * 1.7, radius * 1.7),
+                QRectF(tx, cy - radius * 0.9, radius * 1.7, radius * 1.7),
                 Qt.AlignmentFlag.AlignCenter, '🏆',
             )
 
         painter.restore()
+
+
+
+
