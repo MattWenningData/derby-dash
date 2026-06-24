@@ -562,8 +562,8 @@ class BoardWidget(QWidget):
         painter.setBrush(QColor(255, 50, 50, 230))
         painter.drawRoundedRect(QRectF(lb_x + lb_w * 0.03, lb_y + lb_h * 0.2,
                                        lb_w * 0.45, lb_h), 1, 1)
-        # Blue LEDs right half
-        painter.setBrush(QColor(60, 120, 255, 230))
+        # White LEDs right half
+        painter.setBrush(QColor(240, 240, 255, 230))
         painter.drawRoundedRect(QRectF(lb_x + lb_w * 0.52, lb_y + lb_h * 0.2,
                                        lb_w * 0.45, lb_h), 1, 1)
 
