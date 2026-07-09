@@ -14,10 +14,11 @@ class BoardWidget(QWidget):
         super().__init__(parent)
         self.game_state = game_state
         self._pulse = False
+        self._anim_tick = 0
         self.setMinimumSize(640, 400)
 
         self._pulse_timer = QTimer(self)
-        self._pulse_timer.setInterval(550)
+        self._pulse_timer.setInterval(120)   # faster for fire/light animations
         self._pulse_timer.timeout.connect(self._on_pulse_timer)
         self._pulse_timer.start()
 
@@ -25,9 +26,15 @@ class BoardWidget(QWidget):
         self.update()
 
     def _on_pulse_timer(self):
-        if getattr(self.game_state, 'phase', None) == 'done' and getattr(self.game_state, 'winner', None):
-            self._pulse = not self._pulse
+        phase  = getattr(self.game_state, 'phase', None)
+        winner = getattr(self.game_state, 'winner', None)
+        if phase == 'done' and winner:
+            self._anim_tick += 1
+            self._pulse = (self._anim_tick % 6) < 3   # ~3 Hz flip
             self.update()
+        elif phase == 'racing':
+            self._anim_tick += 1
+            self.update()   # keep fire animated
         elif self._pulse:
             self._pulse = False
             self.update()
@@ -278,6 +285,7 @@ class BoardWidget(QWidget):
             self._draw_truck_piece(painter, horse, QPointF(px, cy), piece_r, winner, finish_rect)
 
     def _draw_checkered_finish(self, painter: QPainter, rect: QRectF):
+        import math
         cell = max(8.0, min(13.0, rect.width() / 4.2))
         cols = max(2, int(rect.width()  / cell) + 1)
         rows = max(2, int(rect.height() / cell) + 1)
@@ -289,10 +297,70 @@ class BoardWidget(QWidget):
                 y = rect.top()  + row * cell
                 c = QColor(238, 238, 238) if (row + col) % 2 == 0 else QColor(22, 22, 22)
                 painter.fillRect(QRectF(x, y, cell, cell), c)
-        # Subtle dark tint overlay
         painter.fillRect(rect, QColor(10, 40, 10, 48))
         painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
         painter.drawLine(rect.topLeft(), rect.bottomLeft())
+
+        phase  = getattr(self.game_state, 'phase', None)
+        winner = getattr(self.game_state, 'winner', None)
+        t = self._anim_tick
+
+        if phase == 'done' and winner:
+            # ── Smoke (fire extinguished) ──────────────────────────────────
+            n_puffs = 8
+            for i in range(n_puffs):
+                seed = i * 137 + t // 4
+                ox   = rect.left() + (i / n_puffs) * rect.width() + math.sin(seed * 0.7) * 4
+                base = rect.bottom() - rect.height() * 0.08
+                drift   = ((t // 2 + i * 7) % 60) / 60.0   # 0→1 rise
+                puff_y  = base - drift * rect.height() * 0.85
+                puff_r  = rect.width() * 0.18 * (0.4 + drift * 0.8)
+                alpha   = int(120 * (1.0 - drift))
+                grey    = 160 + (i % 3) * 20
+                puff_g = QRadialGradient(ox, puff_y, puff_r)
+                puff_g.setColorAt(0.0, QColor(grey, grey, grey, alpha))
+                puff_g.setColorAt(1.0, QColor(grey, grey, grey, 0))
+                painter.setBrush(puff_g)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(ox, puff_y), puff_r, puff_r * 0.7)
+        elif phase == 'racing' or phase is None:
+            # ── Flames ────────────────────────────────────────────────────
+            n_flames = 10
+            for i in range(n_flames):
+                fx    = rect.left() + (i + 0.5) * rect.width() / n_flames
+                phase_off = (i * 31 + t * 2) % 60
+                h_frac    = 0.35 + 0.55 * abs(math.sin(phase_off * 0.105))
+                fh    = rect.height() * h_frac
+                fw    = rect.width() / n_flames * 1.1
+                # Outer orange
+                fg = QLinearGradient(fx, rect.bottom(), fx, rect.bottom() - fh)
+                fg.setColorAt(0.0, QColor(220, 80, 0, 200))
+                fg.setColorAt(0.5, QColor(255, 160, 0, 160))
+                fg.setColorAt(1.0, QColor(255, 240, 60, 0))
+                flame_path = QPainterPath()
+                tip_x = fx + math.sin((t + i * 7) * 0.18) * fw * 0.3
+                flame_path.moveTo(fx - fw/2, rect.bottom())
+                flame_path.quadTo(fx - fw * 0.1, rect.bottom() - fh * 0.5,
+                                  tip_x, rect.bottom() - fh)
+                flame_path.quadTo(fx + fw * 0.1, rect.bottom() - fh * 0.5,
+                                  fx + fw/2, rect.bottom())
+                flame_path.closeSubpath()
+                painter.setBrush(fg)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawPath(flame_path)
+                # Inner white-yellow core
+                core_h = fh * 0.45
+                cg = QLinearGradient(fx, rect.bottom(), fx, rect.bottom() - core_h)
+                cg.setColorAt(0.0, QColor(255, 255, 180, 180))
+                cg.setColorAt(1.0, QColor(255, 200, 50, 0))
+                core_path = QPainterPath()
+                core_path.moveTo(fx - fw * 0.22, rect.bottom())
+                core_path.quadTo(tip_x, rect.bottom() - core_h,
+                                 fx + fw * 0.22, rect.bottom())
+                core_path.closeSubpath()
+                painter.setBrush(cg)
+                painter.drawPath(core_path)
+
         painter.restore()
 
     # ── Footer ─────────────────────────────────────────────────────────────────
@@ -421,13 +489,14 @@ class BoardWidget(QWidget):
         cab_top     = by - cab_h_extra
         cab_h       = th + cab_h_extra
 
-        # ── Winner pulse glow ──────────────────────────────────────────────
+        # ── Winner LED flash (red / white alternating like real fire truck) ─
         if is_winner:
-            glow_r = radius * (2.1 if self._pulse else 1.5)
-            glow_a = 180 if self._pulse else 90
-            for r_mult, a_div in ((1.0, 1), (1.3, 3), (1.7, 6)):
-                painter.setBrush(QColor(255, 210, 0, glow_a // a_div))
-                painter.drawEllipse(center, glow_r * r_mult, glow_r * r_mult)
+            # _pulse alternates every ~360ms — one half red, one half white
+            flash_col = QColor(255, 60, 60, 200) if self._pulse else QColor(240, 240, 255, 200)
+            for r_mult, a_div in ((1.8, 1), (2.4, 3), (3.0, 7)):
+                painter.setBrush(QColor(flash_col.red(), flash_col.green(),
+                                        flash_col.blue(), flash_col.alpha() // a_div))
+                painter.drawEllipse(center, radius * r_mult, radius * r_mult)
 
         # ── Drop shadow ────────────────────────────────────────────────────
         shadow = QPainterPath()
@@ -558,12 +627,17 @@ class BoardWidget(QWidget):
         # Bar housing
         painter.setBrush(QColor(30, 30, 30))
         painter.drawRoundedRect(QRectF(lb_x, lb_y, lb_w, lb_h * 1.6), 1, 1)
-        # Red LEDs left half
-        painter.setBrush(QColor(255, 50, 50, 230))
+        if is_winner:
+            # Flash: alternating halves (left=red when _pulse, right=white; then swap)
+            left_col  = QColor(255, 50, 50, 230) if self._pulse else QColor(240, 240, 255, 230)
+            right_col = QColor(240, 240, 255, 230) if self._pulse else QColor(255, 50, 50, 230)
+        else:
+            left_col  = QColor(255, 50, 50, 230)
+            right_col = QColor(240, 240, 255, 230)
+        painter.setBrush(left_col)
         painter.drawRoundedRect(QRectF(lb_x + lb_w * 0.03, lb_y + lb_h * 0.2,
                                        lb_w * 0.45, lb_h), 1, 1)
-        # White LEDs right half
-        painter.setBrush(QColor(240, 240, 255, 230))
+        painter.setBrush(right_col)
         painter.drawRoundedRect(QRectF(lb_x + lb_w * 0.52, lb_y + lb_h * 0.2,
                                        lb_w * 0.45, lb_h), 1, 1)
 
@@ -604,6 +678,46 @@ class BoardWidget(QWidget):
                 QRectF(tx, cy - radius * 0.9, radius * 1.7, radius * 1.7),
                 Qt.AlignmentFlag.AlignCenter, '🏆',
             )
+
+        # ── Deck gun water arc (winner only) ──────────────────────────────
+        if is_winner:
+            import math
+            # Gun mounts on top of body near centre
+            gun_x = bx + body_w * 0.55
+            gun_y = by - radius * 0.10
+            # Arc target: middle of the finish column
+            target_x = finish_rect.left() + finish_rect.width() * 0.3
+            target_y = cy
+
+            # Animated water droplets along a parabolic arc
+            dist   = target_x - gun_x
+            n_drops = 14
+            t_val  = self._anim_tick
+            for di in range(n_drops):
+                # staggered travel progress (0→1), animated with time offset
+                progress = ((di / n_drops) + (t_val * 0.04)) % 1.0
+                # Parabolic arc: y = gun_y + (target_y - gun_y)*t - height*4*t*(1-t)
+                arc_h = abs(dist) * 0.40
+                drop_x = gun_x + progress * dist
+                drop_y = (gun_y + (target_y - gun_y) * progress
+                          - arc_h * 4 * progress * (1 - progress))
+                # Fade in/out and size vary by position
+                alpha  = int(200 * math.sin(progress * math.pi))
+                r_drop = max(1.5, radius * 0.08 * (0.5 + math.sin(progress * math.pi) * 0.7))
+                # Water colour: bright cyan/blue
+                dg = QRadialGradient(drop_x, drop_y, r_drop * 2)
+                dg.setColorAt(0.0, QColor(140, 220, 255, alpha))
+                dg.setColorAt(0.6, QColor(60, 160, 255, alpha // 2))
+                dg.setColorAt(1.0, QColor(30, 100, 200, 0))
+                painter.setBrush(dg)
+                painter.setPen(Qt.PenStyle.NoPen)
+                painter.drawEllipse(QPointF(drop_x, drop_y), r_drop * 2, r_drop * 2)
+
+            # Draw the gun barrel itself
+            painter.setPen(QPen(QColor(60, 60, 60), max(1.0, radius * 0.10)))
+            painter.drawLine(QPointF(gun_x, gun_y),
+                             QPointF(gun_x + dist * 0.12, gun_y - radius * 0.35))
+            painter.setPen(Qt.PenStyle.NoPen)
 
         painter.restore()
 

@@ -91,6 +91,17 @@ def load_recent_winners(limit: int = 10):
         })
     return race_count, recent
 
+
+def reset_race_history() -> None:
+    """Delete the race history CSV, resetting the counter to zero."""
+    path = get_history_path()
+    try:
+        if path.exists():
+            path.unlink()
+    except Exception:
+        pass
+
+
 def load_history() -> List[Dict[str, str]]:
     """Return all saved races as a list of dicts (newest first)."""
     path = get_history_path()

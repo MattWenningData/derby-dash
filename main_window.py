@@ -26,6 +26,7 @@ class MainWindow(QMainWindow):
 
         # Auto-roll state
         self._auto_rolling  = False
+        self._roll_delay_ms = 1200
         self._auto_timer    = QTimer(self)
         self._auto_timer.setSingleShot(True)
         self._auto_timer.timeout.connect(self._auto_roll_step)
@@ -81,6 +82,7 @@ class MainWindow(QMainWindow):
         self.panel.admin_requested.connect(self._open_admin)
         self.panel.webcam_requested.connect(self._open_webcam)
         self.panel.history_requested.connect(self._open_history)
+        self.panel.speed_changed.connect(self._set_roll_speed)
         self.panel.show_on_second_screen()
 
         self.status_bar = QStatusBar()
@@ -92,6 +94,9 @@ class MainWindow(QMainWindow):
             self.showMaximized()
         else:
             self.showFullScreen()
+
+    def _set_roll_speed(self, ms: int):
+        self._roll_delay_ms = ms
 
     def _show_controls(self):
         """Raise (or re-show) the control window."""
@@ -143,7 +148,7 @@ class MainWindow(QMainWindow):
             self._auto_rolling = False
             QTimer.singleShot(1200, lambda: self._announce_winner(horse))
         else:
-            self._auto_timer.start(1200)
+            self._auto_timer.start(self._roll_delay_ms)
 
     # ── Game actions ───────────────────────────────────────────────────────
 
@@ -194,11 +199,7 @@ class MainWindow(QMainWindow):
     # ── Winner announcement ────────────────────────────────────────────────
 
     def _announce_winner(self, horse: int):
-        from constants import COMBINATIONS
         from race_history import save_race
-        combos = COMBINATIONS[horse]
-        odds   = 36 // combos
-
         try:
             save_race(self.game)
         except Exception:
@@ -206,7 +207,6 @@ class MainWindow(QMainWindow):
 
         banner_text = (
             f'🏆  TRUCK #{horse} WINS!     '
-            f'Combos: {combos}/36  •  Odds ≈ {odds}:1  •  '
             f'Total rolls: {len(self.game.roll_log)}'
         )
         self._winner_banner.setText(banner_text)

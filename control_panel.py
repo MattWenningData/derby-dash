@@ -366,53 +366,72 @@ class RaceRecordWidget(QWidget):
         p = QPainter(self)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
         p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
-        w, h = self.width(), self.height()
+        w, h = float(self.width()), float(self.height())
 
         # ── Race count header ─────────────────────────────────────────────
-        count_h = max(28.0, h * 0.14)
+        count_h = h * 0.12
         hdr_grad = QLinearGradient(0, 0, 0, count_h)
         hdr_grad.setColorAt(0.0, QColor('#2A1C08'))
         hdr_grad.setColorAt(1.0, QColor('#1A1006'))
         p.setBrush(hdr_grad)
         p.setPen(Qt.PenStyle.NoPen)
-        p.drawRoundedRect(QRectF(0, 0, w, count_h), 5, 5)
+        p.drawRoundedRect(QRectF(0, 0, w, count_h), 4, 4)
 
+        count_pt = max(6.0, min(count_h * 0.48, w * 0.07))
         count_f = QFont('Georgia')
         count_f.setBold(True)
-        count_f.setPointSizeF(max(8.0, count_h * 0.42))
+        count_f.setPointSizeF(count_pt)
         p.setFont(count_f)
         p.setPen(QColor('#E8C84A'))
         p.drawText(QRectF(0, 0, w, count_h), Qt.AlignmentFlag.AlignCenter,
                    f'🏁  Total Races: {self._race_count}')
 
+        body_y = count_h + 2
+        body_h = h - body_y
+
         if not self._winners:
             p.setPen(QColor('#806040'))
             nf = QFont('Georgia')
             nf.setItalic(True)
-            nf.setPointSizeF(max(7.0, h * 0.07))
+            nf.setPointSizeF(max(6.0, body_h * 0.12))
             p.setFont(nf)
-            p.drawText(QRectF(0, count_h + 4, w, h - count_h - 4),
+            p.drawText(QRectF(0, body_y, w, body_h),
                        Qt.AlignmentFlag.AlignCenter, 'No races yet')
             p.end()
             return
 
         # ── Winner rows ───────────────────────────────────────────────────
         rows = len(self._winners)
-        row_h = (h - count_h - 4) / max(rows, 1)
-        medal = {1: '🥇', 2: '🥈', 3: '🥉'}
+        row_h = body_h / rows
 
-        row_f = QFont('Georgia')
-        row_f.setBold(True)
-        num_f = QFont('Georgia')
-        num_f.setBold(True)
+        # All font sizes derived purely from row_h and w — no fixed minimums that overflow
+        rank_pt   = min(row_h * 0.38, w * 0.055)
+        truck_pt  = min(row_h * 0.40, w * 0.060)
+        rolls_pt  = min(row_h * 0.32, w * 0.048)
+        rank_pt   = max(5.0, rank_pt)
+        truck_pt  = max(5.0, truck_pt)
+        rolls_pt  = max(4.5, rolls_pt)
+
+        rank_f = QFont('Georgia')
+        rank_f.setBold(True)
+        rank_f.setPointSizeF(rank_pt)
+
+        num_f = QFont('Segoe UI Emoji')
+        num_f.setPointSizeF(truck_pt)
+
+        rolls_f = QFont('Consolas')
+        rolls_f.setPointSizeF(rolls_pt)
+
+        rank_w  = w * 0.18
+        pip_r   = min(row_h * 0.18, w * 0.030)
+        truck_x = rank_w + pip_r * 2 + w * 0.03
 
         for i, rec in enumerate(self._winners):
-            ry = count_h + 4 + i * row_h
+            ry = body_y + i * row_h
             cy = ry + row_h / 2
 
-            # Alternating row background
             if i % 2 == 0:
-                p.setBrush(QColor(30, 20, 8, 120))
+                p.setBrush(QColor(30, 20, 8, 100))
                 p.setPen(Qt.PenStyle.NoPen)
                 p.drawRect(QRectF(0, ry, w, row_h))
 
@@ -422,42 +441,31 @@ class RaceRecordWidget(QWidget):
                 truck_num = 0
             color = QColor(HORSE_COLORS.get(truck_num, '#C0963A'))
 
-            # Rank medal / race number
-            rank_w = max(22.0, w * 0.14)
-            rank_f = QFont('Segoe UI Emoji')
-            rank_f.setPointSizeF(max(7.0, row_h * 0.42))
+            # Race # (left)
             p.setFont(rank_f)
             p.setPen(QColor('#C8A84B'))
-            rank_txt = medal.get(rec['race_num'] if rows <= 3 else None, f"#{rec['race_num']}")
-            # Just use race number — medals only make sense for top 3 all-time
-            rank_lbl = f"#{rec['race_num']}"
             p.drawText(QRectF(2, ry, rank_w, row_h),
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, rank_lbl)
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                       f'#{rec["race_num"]}')
 
-            # Truck colour pip
-            pip_r = max(4.0, row_h * 0.22)
+            # Colour pip
             p.setBrush(color)
             p.setPen(QPen(color.lighter(130), 1))
             p.drawEllipse(QPointF(rank_w + pip_r + 2, cy), pip_r, pip_r)
 
-            # "🚒 #N" winner label
-            num_f.setPointSizeF(max(7.5, row_h * 0.44))
+            # Truck winner (middle)
             p.setFont(num_f)
             p.setPen(color.lighter(150))
             winner_txt = f'🚒 #{truck_num}' if truck_num else '?'
-            truck_x = rank_w + pip_r * 2 + 8
-            truck_w = max(48.0, w * 0.38)
-            p.drawText(QRectF(truck_x, ry, truck_w, row_h),
+            p.drawText(QRectF(truck_x, ry, w - truck_x - w * 0.18, row_h),
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, winner_txt)
 
-            # Rolls count (right-aligned)
-            rolls_f = QFont('Consolas')
-            rolls_f.setPointSizeF(max(6.5, row_h * 0.36))
+            # Rolls (right)
             p.setFont(rolls_f)
             p.setPen(QColor('#907050'))
-            rolls_txt = f"{rec['total_rolls']}r"
             p.drawText(QRectF(0, ry, w - 4, row_h),
-                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, rolls_txt)
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
+                       f"{rec['total_rolls']}r")
 
         p.end()
 
@@ -475,8 +483,7 @@ class CompactRacePanel(QWidget):
     def __init__(self, game_state: GameState, parent=None):
         super().__init__(parent)
         self.game_state = game_state
-        self.setMinimumWidth(160)
-        self.setMaximumWidth(300)
+        self.setMinimumWidth(140)
         self.setSizePolicy(QSizePolicy.Policy.Preferred, QSizePolicy.Policy.Expanding)
         self._build()
 
@@ -512,11 +519,30 @@ class CompactRacePanel(QWidget):
         history_vb.addWidget(self.race_history_panel)
         root.addWidget(history_grp, stretch=3)
 
+        btn_row = QHBoxLayout()
+        btn_row.setSpacing(4)
         btn_ctrl = QPushButton('📺  Controls')
         btn_ctrl.setToolTip('Raise the Controls window (second screen)')
-        btn_ctrl.setMinimumHeight(32)
         btn_ctrl.clicked.connect(self.controls_requested)
-        root.addWidget(btn_ctrl)
+        btn_reset_races = QPushButton('🗑  Reset Counter')
+        btn_reset_races.setObjectName('btn_reset')
+        btn_reset_races.setToolTip('Clear race history and reset the counter to 0')
+        btn_reset_races.clicked.connect(self._reset_race_counter)
+        btn_row.addWidget(btn_ctrl, stretch=3)
+        btn_row.addWidget(btn_reset_races, stretch=2)
+        root.addLayout(btn_row)
+
+    def _reset_race_counter(self):
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, 'Reset Race Counter',
+            'This will clear all race history and reset the counter to 0.\nAre you sure?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            from race_history import reset_race_history
+            reset_race_history()
+            self.race_history_panel.refresh()
 
     def show_roll_animation(self, on_complete=None):
         """Animate dice tumbling fast→slow, then settle on the final result."""
@@ -594,6 +620,7 @@ class ControlPanel(QWidget):
     admin_requested     = pyqtSignal()
     webcam_requested    = pyqtSignal()
     history_requested   = pyqtSignal()
+    speed_changed       = pyqtSignal(int)   # emits delay in ms
 
     def __init__(self, game_state: GameState, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
@@ -666,6 +693,28 @@ class ControlPanel(QWidget):
         roll_row.addWidget(self.btn_auto, stretch=2)
         root.addLayout(roll_row)
 
+        # ── Roll speed slider ─────────────────────────────────────────────
+        from PyQt6.QtWidgets import QSlider
+        speed_row = QHBoxLayout()
+        speed_row.setSpacing(6)
+        speed_lbl = QLabel('⏱  Roll Speed:')
+        speed_lbl.setObjectName('speed_lbl')
+        self._speed_val_lbl = QLabel('1.2s')
+        self._speed_val_lbl.setObjectName('speed_val_lbl')
+        self._speed_val_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self._speed_slider = QSlider(Qt.Orientation.Horizontal)
+        self._speed_slider.setMinimum(3)    # 0.3s (fastest)
+        self._speed_slider.setMaximum(60)   # 6.0s (slowest)
+        self._speed_slider.setValue(12)     # default 1.2s
+        self._speed_slider.setTickInterval(6)
+        self._speed_slider.setTickPosition(QSlider.TickPosition.TicksBelow)
+        self._speed_slider.valueChanged.connect(self._on_speed_changed)
+        speed_row.addWidget(speed_lbl, stretch=0)
+        speed_row.addWidget(self._speed_slider, stretch=1)
+        speed_row.addWidget(self._speed_val_lbl, stretch=0)
+        root.addLayout(speed_row)
+        self._speed_lbl = speed_lbl
+
         # ── Race Standings ────────────────────────────────────────────────
         standings_grp = QGroupBox('Race Standings')
         standings_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -716,6 +765,11 @@ class ControlPanel(QWidget):
         self._util_btns = [self.btn_webcam, self.btn_admin,
                            self.btn_history, self.btn_reset]
 
+    def _on_speed_changed(self, val: int):
+        ms = val * 100
+        self._speed_val_lbl.setText(f'{ms/1000:.1f}s')
+        self.speed_changed.emit(ms)
+
     # ── Resize: every element scales with window size ──────────────────────
 
     def resizeEvent(self, event):
@@ -723,7 +777,7 @@ class ControlPanel(QWidget):
         w, h = self.width(), self.height()
 
         # Root layout spacing scales with height
-        self.layout().setSpacing(max(4, int(h * 0.008)))
+        self.layout().setSpacing(max(3, int(h * 0.007)))
 
         # ── Status label ──────────────────────────────────────────────────
         sp = max(11, min(42, int(w * 0.032)))
@@ -744,27 +798,50 @@ class ControlPanel(QWidget):
 
         # ── Roll button ───────────────────────────────────────────────────
         rp = max(13, min(48, int(w * 0.036)))
-        rh = max(44, min(120, int(h * 0.072)))
+        rh = max(40, min(120, int(h * 0.068)))
         self.btn_roll.setStyleSheet(
             f'font-size: {rp}px; min-height: {rh}px;'
             f'background: qlineargradient(x1:0,y1:0,x2:0,y2:1,'
             f'stop:0 #D4A018,stop:0.4 #B08010,stop:0.85 #886008,stop:1 #604006);'
             f'color: #FFF8E0; border: 1px solid #E8C840; border-top: 1px solid #F8E060;'
             f'border-bottom: 3px solid #2A1C00; border-radius: 8px; font-weight: bold;'
-            f'font-family: Georgia, serif; padding: {max(6,int(rh*0.15))}px 12px;'
+            f'font-family: Georgia, serif; padding: {max(4,int(rh*0.12))}px 12px;'
         )
 
         # ── Auto Roll button ──────────────────────────────────────────────
         ap = max(11, min(36, int(w * 0.028)))
-        ah = max(36, min(100, int(h * 0.056)))
+        ah = max(34, min(100, int(h * 0.052)))
         self.btn_auto.setStyleSheet(
             f'font-size: {ap}px; min-height: {ah}px;'
             f'padding: {max(4,int(ah*0.12))}px 10px;'
         )
 
+        # ── Speed slider row ──────────────────────────────────────────────
+        slp = max(9, min(22, int(w * 0.024)))
+        lbl_style = f'font-size: {slp}px; color: #C8A84B; font-family: Georgia, serif;'
+        self._speed_lbl.setStyleSheet(lbl_style)
+        self._speed_val_lbl.setStyleSheet(
+            f'font-size: {slp}px; font-weight: bold; color: #E8C84A; font-family: Georgia, serif; min-width: {max(28, int(w*0.10))}px;'
+        )
+
+        # ── GroupBox title fonts (applied via stylesheet) ─────────────────
+        gbp = max(8, min(18, int(w * 0.022)))
+        gb_style = (
+            f'QGroupBox {{ font-size: {gbp}px; font-weight: bold; color: #C0963A;'
+            f'border: 1px solid #3C2A10; border-radius: {max(6,int(w*0.016))}px;'
+            f'margin-top: {max(10,int(h*0.018))}px; padding: 4px 4px;'
+            f'background: qlineargradient(x1:0,y1:0,x2:0,y2:1,stop:0 #1A1008,stop:1 #120C06);'
+            f'font-family: Georgia, serif; letter-spacing: 0.8px; text-transform: uppercase; }}'
+            f'QGroupBox::title {{ subcontrol-origin: margin; subcontrol-position: top left;'
+            f'padding: 1px {max(6,int(w*0.016))}px; color: #C8A84B; background: #18100A;'
+            f'border: 1px solid #3C2A10; border-radius: 4px; }}'
+        )
+        for grp in self.findChildren(QGroupBox):
+            grp.setStyleSheet(gb_style)
+
         # ── Utility buttons ───────────────────────────────────────────────
         up = max(10, min(28, int(w * 0.024)))
-        uh = max(32, min(80, int(h * 0.048)))
+        uh = max(30, min(80, int(h * 0.046)))
         util_style = (
             f'font-size: {up}px; min-height: {uh}px;'
             f'padding: {max(3,int(uh*0.12))}px 8px;'
