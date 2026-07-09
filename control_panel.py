@@ -524,25 +524,8 @@ class CompactRacePanel(QWidget):
         btn_ctrl = QPushButton('📺  Controls')
         btn_ctrl.setToolTip('Raise the Controls window (second screen)')
         btn_ctrl.clicked.connect(self.controls_requested)
-        btn_reset_races = QPushButton('🗑  Reset Counter')
-        btn_reset_races.setObjectName('btn_reset')
-        btn_reset_races.setToolTip('Clear race history and reset the counter to 0')
-        btn_reset_races.clicked.connect(self._reset_race_counter)
-        btn_row.addWidget(btn_ctrl, stretch=3)
-        btn_row.addWidget(btn_reset_races, stretch=2)
+        btn_row.addWidget(btn_ctrl)
         root.addLayout(btn_row)
-
-    def _reset_race_counter(self):
-        from PyQt6.QtWidgets import QMessageBox
-        reply = QMessageBox.question(
-            self, 'Reset Race Counter',
-            'This will clear all race history and reset the counter to 0.\nAre you sure?',
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if reply == QMessageBox.StandardButton.Yes:
-            from race_history import reset_race_history
-            reset_race_history()
-            self.race_history_panel.refresh()
 
     def show_roll_animation(self, on_complete=None):
         """Animate dice tumbling fast→slow, then settle on the final result."""
@@ -621,6 +604,7 @@ class ControlPanel(QWidget):
     webcam_requested    = pyqtSignal()
     history_requested   = pyqtSignal()
     speed_changed       = pyqtSignal(int)   # emits delay in ms
+    counter_reset       = pyqtSignal()      # emitted after race history is cleared
 
     def __init__(self, game_state: GameState, parent=None):
         super().__init__(parent, Qt.WindowType.Window)
@@ -761,9 +745,29 @@ class ControlPanel(QWidget):
         util_grid.addLayout(col2)
         root.addLayout(util_grid)
 
+        # ── Reset Race Counter button ──────────────────────────────────────
+        self.btn_reset_counter = QPushButton('🗑  Reset Race Counter')
+        self.btn_reset_counter.setObjectName('btn_reset_counter')
+        self.btn_reset_counter.setToolTip('Clear all race history and reset the counter to 0')
+        self.btn_reset_counter.clicked.connect(self._reset_race_counter)
+        root.addWidget(self.btn_reset_counter)
+
         # Store all util buttons for batch resizing
         self._util_btns = [self.btn_webcam, self.btn_admin,
-                           self.btn_history, self.btn_reset]
+                           self.btn_history, self.btn_reset,
+                           self.btn_reset_counter]
+
+    def _reset_race_counter(self):
+        from PyQt6.QtWidgets import QMessageBox
+        reply = QMessageBox.question(
+            self, 'Reset Race Counter',
+            'This will clear all race history and reset the counter to 0.\nAre you sure?',
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if reply == QMessageBox.StandardButton.Yes:
+            from race_history import reset_race_history
+            reset_race_history()
+            self.counter_reset.emit()
 
     def _on_speed_changed(self, val: int):
         ms = val * 100

@@ -289,24 +289,36 @@ class BoardWidget(QWidget):
         painter.save()
         painter.setClipRect(rect)
 
-        # ── Finish column background: dark green-to-amber gradient ────────
+        # ── Finish column background ───────────────────────────────────────
         bg = QLinearGradient(rect.topLeft(), rect.topRight())
-        bg.setColorAt(0.0, QColor(10, 45, 10))
-        bg.setColorAt(0.5, QColor(30, 80, 20))
-        bg.setColorAt(1.0, QColor(10, 45, 10))
+        bg.setColorAt(0.0, QColor(8, 35, 8))
+        bg.setColorAt(0.45, QColor(22, 60, 15))
+        bg.setColorAt(0.55, QColor(22, 60, 15))
+        bg.setColorAt(1.0, QColor(8, 35, 8))
         painter.fillRect(rect, bg)
 
-        # Vertical amber stripe running down the centre of the column
-        stripe_w = max(4.0, rect.width() * 0.22)
-        stripe_x = rect.left() + (rect.width() - stripe_w) / 2
-        stripe_g = QLinearGradient(stripe_x, rect.top(), stripe_x + stripe_w, rect.top())
-        stripe_g.setColorAt(0.0, QColor(200, 160, 30, 0))
-        stripe_g.setColorAt(0.5, QColor(200, 160, 30, 180))
-        stripe_g.setColorAt(1.0, QColor(200, 160, 30, 0))
-        painter.fillRect(QRectF(stripe_x, rect.top(), stripe_w, rect.height()), stripe_g)
+        # Horizontal glowing bands — one per lane — give structure without
+        # being a checkered flag.  Bands are amber with a soft glow.
+        n_bands = 11   # matches number of horses (2–12)
+        band_h  = rect.height() / n_bands
+        for i in range(n_bands):
+            y = rect.top() + i * band_h
+            # Alternate between two subtly different band colours
+            if i % 2 == 0:
+                band_col = QColor(180, 130, 20, 55)
+            else:
+                band_col = QColor(10, 50, 10, 80)
+            painter.fillRect(QRectF(rect.left(), y, rect.width(), band_h), band_col)
 
-        # Left edge separator line
-        painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
+        # Left-edge glow: bright amber seam where trucks cross the line
+        seam_g = QLinearGradient(rect.left(), rect.top(), rect.left() + rect.width() * 0.35, rect.top())
+        seam_g.setColorAt(0.0, QColor(255, 200, 40, 200))
+        seam_g.setColorAt(0.4, QColor(200, 140, 20, 80))
+        seam_g.setColorAt(1.0, QColor(200, 140, 20, 0))
+        painter.fillRect(QRectF(rect.left(), rect.top(), rect.width() * 0.35, rect.height()), seam_g)
+
+        # Hard left-edge line (finish line itself)
+        painter.setPen(QPen(QColor(255, 220, 60, 180), 2))
         painter.drawLine(rect.topLeft(), rect.bottomLeft())
 
         phase  = getattr(self.game_state, 'phase', None)
@@ -314,39 +326,36 @@ class BoardWidget(QWidget):
         t = self._anim_tick
 
         if phase == 'done' and winner:
-            # ── Smoke: puffs originate at left edge and drift right ────────
-            n_puffs = 8
-            for i in range(n_puffs):
-                # Spread puffs vertically along the left edge
-                fy = rect.top() + (i + 0.5) * rect.height() / n_puffs
-                # drift 0→1 moves puff rightward across the column
-                drift   = ((t // 2 + i * 7) % 60) / 60.0
-                puff_x  = rect.left() + drift * rect.width() * 0.9
-                puff_wobble = math.sin((t * 0.07 + i * 1.1)) * rect.height() * 0.03
-                puff_y  = fy + puff_wobble
-                puff_r  = rect.height() / n_puffs * 0.7 * (0.4 + drift * 0.8)
-                alpha   = int(130 * (1.0 - drift))
-                grey    = 160 + (i % 3) * 20
-                puff_g = QRadialGradient(puff_x, puff_y, puff_r)
-                puff_g.setColorAt(0.0, QColor(grey, grey, grey, alpha))
-                puff_g.setColorAt(1.0, QColor(grey, grey, grey, 0))
-                painter.setBrush(puff_g)
-                painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawEllipse(QPointF(puff_x, puff_y), puff_r, puff_r * 0.75)
+            # ── Smoke: large billowing puffs drifting left→right ──────────
+            for layer in range(3):                        # 3 layers → denser
+                n_puffs = 12
+                for i in range(n_puffs):
+                    fy = rect.top() + (i + 0.5 + layer * 0.33) * rect.height() / n_puffs
+                    offset = i * 9 + layer * 23
+                    drift  = ((t // 2 + offset) % 60) / 60.0    # shorter cycle = more puffs visible
+                    puff_x = rect.left() + drift * rect.width() * 1.05
+                    puff_y = fy + math.sin(t * 0.06 + i * 1.3 + layer) * rect.height() * 0.04
+                    grow   = 0.5 + drift * 1.6             # puffs start bigger, grow more
+                    puff_r = rect.height() / n_puffs * grow
+                    alpha  = int(220 * (1.0 - drift ** 0.6))   # higher base alpha, slower fade
+                    grey   = 140 + (i % 4) * 18 + layer * 20
+                    puff_g = QRadialGradient(puff_x, puff_y, puff_r)
+                    puff_g.setColorAt(0.0, QColor(grey, grey, grey, alpha))
+                    puff_g.setColorAt(0.45, QColor(grey, grey, grey, alpha // 2))
+                    puff_g.setColorAt(1.0, QColor(grey, grey, grey, 0))
+                    painter.setBrush(puff_g)
+                    painter.setPen(Qt.PenStyle.NoPen)
+                    painter.drawEllipse(QPointF(puff_x, puff_y), puff_r, puff_r * 0.8)
+
         elif phase == 'racing' or phase is None:
             # ── Flames: originate at left edge, tips point right ──────────
             n_flames = 10
             for i in range(n_flames):
-                # Each flame is centred vertically at its lane position
                 fy    = rect.top() + (i + 0.5) * rect.height() / n_flames
                 phase_off = (i * 31 + t * 2) % 60
-                # fh = how far right the flame extends (was vertical height)
                 fh    = rect.width() * (0.55 + 0.45 * abs(math.sin(phase_off * 0.105)))
-                # fw = the lateral (vertical) thickness of each flame tongue
                 fw    = rect.height() / n_flames * 1.1
-                # tip wiggles vertically (was horizontal)
                 tip_y = fy + math.sin((t + i * 7) * 0.18) * fw * 0.3
-                # Gradient: base at left edge → transparent at tip (right)
                 fg = QLinearGradient(rect.left(), fy, rect.left() + fh, fy)
                 fg.setColorAt(0.0, QColor(220, 80, 0, 200))
                 fg.setColorAt(0.5, QColor(255, 160, 0, 160))
@@ -361,7 +370,6 @@ class BoardWidget(QWidget):
                 painter.setBrush(fg)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawPath(flame_path)
-                # Inner white-yellow core
                 core_w = fh * 0.45
                 cg = QLinearGradient(rect.left(), fy, rect.left() + core_w, fy)
                 cg.setColorAt(0.0, QColor(255, 255, 180, 180))

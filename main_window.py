@@ -83,6 +83,7 @@ class MainWindow(QMainWindow):
         self.panel.webcam_requested.connect(self._open_webcam)
         self.panel.history_requested.connect(self._open_history)
         self.panel.speed_changed.connect(self._set_roll_speed)
+        self.panel.counter_reset.connect(self.compact_panel.race_history_panel.refresh)
         self.panel.show_on_second_screen()
 
         self.status_bar = QStatusBar()
