@@ -286,18 +286,26 @@ class BoardWidget(QWidget):
 
     def _draw_checkered_finish(self, painter: QPainter, rect: QRectF):
         import math
-        cell = max(8.0, min(13.0, rect.width() / 4.2))
-        cols = max(2, int(rect.width()  / cell) + 1)
-        rows = max(2, int(rect.height() / cell) + 1)
         painter.save()
         painter.setClipRect(rect)
-        for row in range(rows):
-            for col in range(cols):
-                x = rect.left() + col * cell
-                y = rect.top()  + row * cell
-                c = QColor(238, 238, 238) if (row + col) % 2 == 0 else QColor(22, 22, 22)
-                painter.fillRect(QRectF(x, y, cell, cell), c)
-        painter.fillRect(rect, QColor(10, 40, 10, 48))
+
+        # ── Finish column background: dark green-to-amber gradient ────────
+        bg = QLinearGradient(rect.topLeft(), rect.topRight())
+        bg.setColorAt(0.0, QColor(10, 45, 10))
+        bg.setColorAt(0.5, QColor(30, 80, 20))
+        bg.setColorAt(1.0, QColor(10, 45, 10))
+        painter.fillRect(rect, bg)
+
+        # Vertical amber stripe running down the centre of the column
+        stripe_w = max(4.0, rect.width() * 0.22)
+        stripe_x = rect.left() + (rect.width() - stripe_w) / 2
+        stripe_g = QLinearGradient(stripe_x, rect.top(), stripe_x + stripe_w, rect.top())
+        stripe_g.setColorAt(0.0, QColor(200, 160, 30, 0))
+        stripe_g.setColorAt(0.5, QColor(200, 160, 30, 180))
+        stripe_g.setColorAt(1.0, QColor(200, 160, 30, 0))
+        painter.fillRect(QRectF(stripe_x, rect.top(), stripe_w, rect.height()), stripe_g)
+
+        # Left edge separator line
         painter.setPen(QPen(QColor(255, 255, 255, 40), 1))
         painter.drawLine(rect.topLeft(), rect.bottomLeft())
 
@@ -306,57 +314,62 @@ class BoardWidget(QWidget):
         t = self._anim_tick
 
         if phase == 'done' and winner:
-            # ── Smoke (fire extinguished) ──────────────────────────────────
+            # ── Smoke: puffs originate at left edge and drift right ────────
             n_puffs = 8
             for i in range(n_puffs):
-                seed = i * 137 + t // 4
-                ox   = rect.left() + (i / n_puffs) * rect.width() + math.sin(seed * 0.7) * 4
-                base = rect.bottom() - rect.height() * 0.08
-                drift   = ((t // 2 + i * 7) % 60) / 60.0   # 0→1 rise
-                puff_y  = base - drift * rect.height() * 0.85
-                puff_r  = rect.width() * 0.18 * (0.4 + drift * 0.8)
-                alpha   = int(120 * (1.0 - drift))
+                # Spread puffs vertically along the left edge
+                fy = rect.top() + (i + 0.5) * rect.height() / n_puffs
+                # drift 0→1 moves puff rightward across the column
+                drift   = ((t // 2 + i * 7) % 60) / 60.0
+                puff_x  = rect.left() + drift * rect.width() * 0.9
+                puff_wobble = math.sin((t * 0.07 + i * 1.1)) * rect.height() * 0.03
+                puff_y  = fy + puff_wobble
+                puff_r  = rect.height() / n_puffs * 0.7 * (0.4 + drift * 0.8)
+                alpha   = int(130 * (1.0 - drift))
                 grey    = 160 + (i % 3) * 20
-                puff_g = QRadialGradient(ox, puff_y, puff_r)
+                puff_g = QRadialGradient(puff_x, puff_y, puff_r)
                 puff_g.setColorAt(0.0, QColor(grey, grey, grey, alpha))
                 puff_g.setColorAt(1.0, QColor(grey, grey, grey, 0))
                 painter.setBrush(puff_g)
                 painter.setPen(Qt.PenStyle.NoPen)
-                painter.drawEllipse(QPointF(ox, puff_y), puff_r, puff_r * 0.7)
+                painter.drawEllipse(QPointF(puff_x, puff_y), puff_r, puff_r * 0.75)
         elif phase == 'racing' or phase is None:
-            # ── Flames ────────────────────────────────────────────────────
+            # ── Flames: originate at left edge, tips point right ──────────
             n_flames = 10
             for i in range(n_flames):
-                fx    = rect.left() + (i + 0.5) * rect.width() / n_flames
+                # Each flame is centred vertically at its lane position
+                fy    = rect.top() + (i + 0.5) * rect.height() / n_flames
                 phase_off = (i * 31 + t * 2) % 60
-                h_frac    = 0.35 + 0.55 * abs(math.sin(phase_off * 0.105))
-                fh    = rect.height() * h_frac
-                fw    = rect.width() / n_flames * 1.1
-                # Outer orange
-                fg = QLinearGradient(fx, rect.bottom(), fx, rect.bottom() - fh)
+                # fh = how far right the flame extends (was vertical height)
+                fh    = rect.width() * (0.55 + 0.45 * abs(math.sin(phase_off * 0.105)))
+                # fw = the lateral (vertical) thickness of each flame tongue
+                fw    = rect.height() / n_flames * 1.1
+                # tip wiggles vertically (was horizontal)
+                tip_y = fy + math.sin((t + i * 7) * 0.18) * fw * 0.3
+                # Gradient: base at left edge → transparent at tip (right)
+                fg = QLinearGradient(rect.left(), fy, rect.left() + fh, fy)
                 fg.setColorAt(0.0, QColor(220, 80, 0, 200))
                 fg.setColorAt(0.5, QColor(255, 160, 0, 160))
                 fg.setColorAt(1.0, QColor(255, 240, 60, 0))
                 flame_path = QPainterPath()
-                tip_x = fx + math.sin((t + i * 7) * 0.18) * fw * 0.3
-                flame_path.moveTo(fx - fw/2, rect.bottom())
-                flame_path.quadTo(fx - fw * 0.1, rect.bottom() - fh * 0.5,
-                                  tip_x, rect.bottom() - fh)
-                flame_path.quadTo(fx + fw * 0.1, rect.bottom() - fh * 0.5,
-                                  fx + fw/2, rect.bottom())
+                flame_path.moveTo(rect.left(), fy - fw / 2)
+                flame_path.quadTo(rect.left() + fh * 0.5, fy - fw * 0.1,
+                                  rect.left() + fh,       tip_y)
+                flame_path.quadTo(rect.left() + fh * 0.5, fy + fw * 0.1,
+                                  rect.left(),             fy + fw / 2)
                 flame_path.closeSubpath()
                 painter.setBrush(fg)
                 painter.setPen(Qt.PenStyle.NoPen)
                 painter.drawPath(flame_path)
                 # Inner white-yellow core
-                core_h = fh * 0.45
-                cg = QLinearGradient(fx, rect.bottom(), fx, rect.bottom() - core_h)
+                core_w = fh * 0.45
+                cg = QLinearGradient(rect.left(), fy, rect.left() + core_w, fy)
                 cg.setColorAt(0.0, QColor(255, 255, 180, 180))
                 cg.setColorAt(1.0, QColor(255, 200, 50, 0))
                 core_path = QPainterPath()
-                core_path.moveTo(fx - fw * 0.22, rect.bottom())
-                core_path.quadTo(tip_x, rect.bottom() - core_h,
-                                 fx + fw * 0.22, rect.bottom())
+                core_path.moveTo(rect.left(), fy - fw * 0.22)
+                core_path.quadTo(rect.left() + core_w, tip_y,
+                                 rect.left(),           fy + fw * 0.22)
                 core_path.closeSubpath()
                 painter.setBrush(cg)
                 painter.drawPath(core_path)
