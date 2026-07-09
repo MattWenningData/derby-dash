@@ -73,7 +73,23 @@ def save_race(game_state) -> Path:
     return path
 
 
-# ── Load history for the viewer ────────────────────────────────────────────────
+# ── Load recent winners for the sidebar ───────────────────────────────────────
+
+def load_recent_winners(limit: int = 10):
+    """Return (race_count, last_N_winners) from the history CSV.
+    winners is a list of dicts with keys: race_num, winner, total_rolls, date.
+    """
+    rows = load_history()          # newest first
+    race_count = len(rows)
+    recent = []
+    for i, row in enumerate(rows[:limit]):
+        recent.append({
+            'race_num':    race_count - i,
+            'winner':      row.get('winner', '?'),
+            'total_rolls': row.get('total_rolls', '?'),
+            'date':        row.get('date', ''),
+        })
+    return race_count, recent
 
 def load_history() -> List[Dict[str, str]]:
     """Return all saved races as a list of dicts (newest first)."""

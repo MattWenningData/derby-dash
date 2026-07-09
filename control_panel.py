@@ -341,6 +341,127 @@ class HorseStandingsWidget(QWidget):
                     Qt.AlignmentFlag.AlignCenter, '🏆')
 
 
+# ── Race record widget (race count + last 10 winners) ─────────────────────────
+
+class RaceRecordWidget(QWidget):
+    """Shows total race count and a list of the last 10 winners."""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._race_count = 0
+        self._winners = []
+        self.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.setMinimumHeight(80)
+
+    def refresh(self):
+        from race_history import load_recent_winners
+        try:
+            self._race_count, self._winners = load_recent_winners(10)
+        except Exception:
+            pass
+        self.update()
+
+    def paintEvent(self, _event):
+        from constants import HORSE_COLORS
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        p.setRenderHint(QPainter.RenderHint.TextAntialiasing)
+        w, h = self.width(), self.height()
+
+        # ── Race count header ─────────────────────────────────────────────
+        count_h = max(28.0, h * 0.14)
+        hdr_grad = QLinearGradient(0, 0, 0, count_h)
+        hdr_grad.setColorAt(0.0, QColor('#2A1C08'))
+        hdr_grad.setColorAt(1.0, QColor('#1A1006'))
+        p.setBrush(hdr_grad)
+        p.setPen(Qt.PenStyle.NoPen)
+        p.drawRoundedRect(QRectF(0, 0, w, count_h), 5, 5)
+
+        count_f = QFont('Georgia')
+        count_f.setBold(True)
+        count_f.setPointSizeF(max(8.0, count_h * 0.42))
+        p.setFont(count_f)
+        p.setPen(QColor('#E8C84A'))
+        p.drawText(QRectF(0, 0, w, count_h), Qt.AlignmentFlag.AlignCenter,
+                   f'🏁  Total Races: {self._race_count}')
+
+        if not self._winners:
+            p.setPen(QColor('#806040'))
+            nf = QFont('Georgia')
+            nf.setItalic(True)
+            nf.setPointSizeF(max(7.0, h * 0.07))
+            p.setFont(nf)
+            p.drawText(QRectF(0, count_h + 4, w, h - count_h - 4),
+                       Qt.AlignmentFlag.AlignCenter, 'No races yet')
+            p.end()
+            return
+
+        # ── Winner rows ───────────────────────────────────────────────────
+        rows = len(self._winners)
+        row_h = (h - count_h - 4) / max(rows, 1)
+        medal = {1: '🥇', 2: '🥈', 3: '🥉'}
+
+        row_f = QFont('Georgia')
+        row_f.setBold(True)
+        num_f = QFont('Georgia')
+        num_f.setBold(True)
+
+        for i, rec in enumerate(self._winners):
+            ry = count_h + 4 + i * row_h
+            cy = ry + row_h / 2
+
+            # Alternating row background
+            if i % 2 == 0:
+                p.setBrush(QColor(30, 20, 8, 120))
+                p.setPen(Qt.PenStyle.NoPen)
+                p.drawRect(QRectF(0, ry, w, row_h))
+
+            try:
+                truck_num = int(rec['winner'])
+            except (ValueError, TypeError):
+                truck_num = 0
+            color = QColor(HORSE_COLORS.get(truck_num, '#C0963A'))
+
+            # Rank medal / race number
+            rank_w = max(22.0, w * 0.14)
+            rank_f = QFont('Segoe UI Emoji')
+            rank_f.setPointSizeF(max(7.0, row_h * 0.42))
+            p.setFont(rank_f)
+            p.setPen(QColor('#C8A84B'))
+            rank_txt = medal.get(rec['race_num'] if rows <= 3 else None, f"#{rec['race_num']}")
+            # Just use race number — medals only make sense for top 3 all-time
+            rank_lbl = f"#{rec['race_num']}"
+            p.drawText(QRectF(2, ry, rank_w, row_h),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, rank_lbl)
+
+            # Truck colour pip
+            pip_r = max(4.0, row_h * 0.22)
+            p.setBrush(color)
+            p.setPen(QPen(color.lighter(130), 1))
+            p.drawEllipse(QPointF(rank_w + pip_r + 2, cy), pip_r, pip_r)
+
+            # "🚒 #N" winner label
+            num_f.setPointSizeF(max(7.5, row_h * 0.44))
+            p.setFont(num_f)
+            p.setPen(color.lighter(150))
+            winner_txt = f'🚒 #{truck_num}' if truck_num else '?'
+            truck_x = rank_w + pip_r * 2 + 8
+            truck_w = max(48.0, w * 0.38)
+            p.drawText(QRectF(truck_x, ry, truck_w, row_h),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft, winner_txt)
+
+            # Rolls count (right-aligned)
+            rolls_f = QFont('Consolas')
+            rolls_f.setPointSizeF(max(6.5, row_h * 0.36))
+            p.setFont(rolls_f)
+            p.setPen(QColor('#907050'))
+            rolls_txt = f"{rec['total_rolls']}r"
+            p.drawText(QRectF(0, ry, w - 4, row_h),
+                       Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight, rolls_txt)
+
+        p.end()
+
+
 # ── Compact right-side panel (main window) ─────────────────────────────────────
 
 class CompactRacePanel(QWidget):
@@ -383,13 +504,13 @@ class CompactRacePanel(QWidget):
         dice_vb.addWidget(self.sum_label)
         root.addWidget(dice_grp, stretch=2)
 
-        standings_grp = QGroupBox('Race Standings')
-        standings_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
-        standings_vb = QVBoxLayout(standings_grp)
-        standings_vb.setContentsMargins(4, 8, 4, 4)
-        self.standings = HorseStandingsWidget(self.game_state)
-        standings_vb.addWidget(self.standings)
-        root.addWidget(standings_grp, stretch=3)
+        history_grp = QGroupBox('Race Record')
+        history_grp.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        history_vb = QVBoxLayout(history_grp)
+        history_vb.setContentsMargins(4, 8, 4, 4)
+        self.race_history_panel = RaceRecordWidget()
+        history_vb.addWidget(self.race_history_panel)
+        root.addWidget(history_grp, stretch=3)
 
         btn_ctrl = QPushButton('📺  Controls')
         btn_ctrl.setToolTip('Raise the Controls window (second screen)')
@@ -446,7 +567,7 @@ class CompactRacePanel(QWidget):
             self.status_lbl.setText('🚒  Roll to Start!')
             self.sum_label.setText('')
 
-        self.standings.refresh()
+        self.race_history_panel.refresh()
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
